@@ -1,0 +1,140 @@
+---
+title: "Bikeability all cities"
+author: "Nicola Maiani"
+date: '2023-08-04'
+output: html_document
+---
+
+# Analyse results
+## Preliminaries
+```{r, message = FALSE, warning = FALSE}
+test_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE))
+    {
+      install.packages(x, dep = TRUE)
+        if(!require(x, character.only = TRUE)) stop("Package not found")
+    }
+}
+
+test_pkg("sf")
+test_pkg("ggplot2")
+test_pkg("sfnetworks")
+test_pkg("tidyverse")
+test_pkg("tidygraph")
+test_pkg("dplyr")
+test_pkg("tmap")
+test_pkg("igraph")
+test_pkg("units")
+test_pkg("sp")
+test_pkg("osmdata")
+test_pkg("foreign")
+test_pkg("ggplot2")
+test_pkg("raster")
+
+dataFolder <- here::here("data")
+RFolder <- here::here()
+figureFolder <- here::here("figs")
+```
+
+```{r}
+# Load statpop data with BA values
+statpop_be <- read.csv(file.path(dataFolder, "bern/statpop_be_bikeability.csv"), sep = ",", header = TRUE)
+statpop_be <- statpop_be %>% 
+  mutate(city = "Bern")
+
+statpop_ls <- read.csv(file.path(dataFolder, "lausanne/statpop_ls_bikeability.csv"), sep = ",", header = TRUE)
+statpop_ls <- statpop_ls %>% 
+  mutate(city = "Lausanne")
+
+statpop_wt <- read.csv(file.path(dataFolder, "winterthur/statpop_wt_bikeability.csv"), sep = ",", header = TRUE)
+statpop_wt <- statpop_wt %>% 
+  mutate(city = "Winterthur")
+
+statpop_zh <- read.csv(file.path(dataFolder, "zurich/statpop_zh_bikeability.csv"), sep = ",", header = TRUE)
+statpop_zh <- statpop_zh %>% 
+  mutate(city = "Zurich")
+
+statpop_all <- rbind(statpop_be, statpop_ls, statpop_wt, statpop_zh)
+
+# write_csv(statpop_all, file = file.path(dataFolder, "statpop_all_bikeability.csv"))
+statpop_all <- read.csv(file.path(dataFolder, "statpop_all_bikeability.csv"), sep = ",", header = TRUE)
+statpop_raster = raster::rasterFromXYZ(statpop_all %>%
+                                          dplyr::select(X, Y, acc_tot_per), crs = CRS("+init=epsg:2056"))
+writeRaster(statpop_raster, "raster_withacc_tot_ls_new", format = "GTiff", overwrite = T) # export raster of different bikeability indices
+```
+
+## With vs. without accidents
+```{r}
+# Histogram of BA values
+hist(statpop_all$acc_tot_per, prob = T, xlab = "BA value", main = "Total BA perceived")
+summary(statpop_all$acc_tot_per)
+```
+
+```{r}
+# Histogram of BA values
+hist(statpop_all$acc_tot_noacc, prob = T, xlab = "BA value", main = "Total BA perceived")
+summary(statpop_all$acc_tot_noacc)
+```
+
+```{r}
+# Percentage change of index with vs. without accidents
+statpop_all <- statpop_all %>%
+  mutate(acc_tot_diff_noacc_rel = ((acc_tot_noacc - acc_tot_per) / acc_tot_per) * 100)
+statpop_all <- statpop_all %>% 
+  mutate(acc_tot_diff_noacc_rel = ifelse(is.na(acc_tot_diff_noacc_rel) & acc_tot_noacc == 0.0, 0,
+                                         ifelse(is.na(acc_tot_diff_noacc_rel) & acc_tot_noacc > 0.0, 100, acc_tot_diff_noacc_rel)))
+
+hist(statpop_all$acc_tot_diff_noacc_rel, prob = T, xlab = "Increase in bikeability index value [%]", main = "Percentage change with vs. without accidents")
+summary(statpop_all$acc_tot_diff_noacc_rel)
+```
+
+## Histogram of BA to train stations
+```{r}
+# Histogram of BA values
+hist(statpop_all$acc_train_stat_per, prob = T, xlab = "BA value", main = "Train station BA perceived")
+```
+
+```{r}
+# Histogram of BA values
+hist(statpop_all$acc_tot_blos_rel, prob = T, xlab = "Relative difference", main = "Difference real vs. BLOS total")
+```
+
+```{r}
+# Histogram of BA values
+hist(statpop_all$acc_train_stat_blos_rel, prob = T, xlab = "Relative difference", main = "Difference real vs. BLOS train station")
+```
+
+## Comparison of BA values
+```{r}
+statpop_all$city <- as.factor(statpop_all$city)
+```
+
+### Total BA index
+```{r}
+# Real distances
+ggplot(statpop_all, aes(x=city, y=acc_tot_real, color=city)) + geom_violin(trim = FALSE) +
+  stat_summary(fun.y=median, geom="point", size=2, color="red") +
+  stat_summary(fun.y=mean, geom="point", size=2, color="blue") +
+  geom_boxplot(width=0.2, outlier.shape = NA) + theme_minimal() + ylab("Bikeability Index") + xlab("City") +
+  theme(legend.position = "none")
+```
+
+### BA index without accidents
+```{r}
+# Perceived distances without accidents
+ggplot(statpop_all, aes(x=city, y=acc_tot_noacc, color=city)) + geom_violin(trim = FALSE) +
+  stat_summary(fun.y=median, geom="point", size=2, color="red") +
+  stat_summary(fun.y=mean, geom="point", size=2, color="blue") +
+  geom_boxplot(width=0.2, outlier.shape = NA) + theme_minimal() + ylab("Bikeability index") + xlab("City") +
+  theme(legend.position = "none")
+```
+
+```{r}
+statpop_all %>% group_by(city) %>% summarise(Median = median(acc_tot_noacc))
+```
+
+
+
+
+

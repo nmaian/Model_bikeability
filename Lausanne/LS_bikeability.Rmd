@@ -1,0 +1,1020 @@
+---
+title: "Bikeability index LS"
+author: "Nicola Maiani"
+date: '2023-08-04'
+output: html_document
+---
+
+# Model bikeability
+## Preliminaries
+```{r, message = FALSE, warning = FALSE}
+test_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE))
+    {
+      install.packages(x, dep = TRUE)
+        if(!require(x, character.only = TRUE)) stop("Package not found")
+    }
+}
+
+test_pkg("sf")
+test_pkg("ggplot2")
+test_pkg("sfnetworks")
+test_pkg("tidyverse")
+test_pkg("tidygraph")
+test_pkg("dplyr")
+test_pkg("tmap")
+test_pkg("igraph")
+test_pkg("units")
+test_pkg("sp")
+test_pkg("osmdata")
+test_pkg("foreign")
+
+dataFolder <- here::here("data")
+RFolder <- here::here()
+figureFolder <- here::here("figs")
+```
+
+## Load data
+```{r, warning = FALSE}
+# Load modeled network
+network <- readRDS(here::here("data", "lausanne/network_quality.rds"))
+
+# City borders
+communities <- st_read(file.path(dataFolder, "gemeindegrenzen/swissBOUNDARIES3D_1_4_TLM_HOHEITSGEBIET.shp")) # load Swiss communities
+border <- communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)
+
+# Take bounding box of community boundaries, since community consist of multiple parts
+border <- st_as_sfc(st_bbox(border)) %>% st_as_sf()
+border_wgs84 <- st_transform(border, crs = 4326) %>% st_bbox() # bounding box of city in WGS84 for OSM query
+
+# Public transport stations -> train stations
+public_trans <- read.csv(file.path(dataFolder, "oev_gueteklassen/OeV_Haltestellen_ARE.csv"), sep = ";", header = TRUE)
+public_trans <- st_as_sf(x = public_trans, coords = c("Y_Koord", "X_Koord"), crs = 2056)
+train_stat <- public_trans %>% filter(Bahnlinie_Anz > 0) # only keep train stations
+train_stat <- st_filter(train_stat, communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) # filter to only use train stations within border
+train_stat <- train_stat %>% # use category of station as weight
+  mutate(weight = ifelse(Hst_Kat == 1, 5,
+                         ifelse(Hst_Kat == 2, 4,
+                                ifelse(Hst_Kat == 3, 3,
+                                       ifelse(Hst_Kat == 4, 2,
+                                              ifelse(Hst_Kat == 5, 1, NA))))))
+
+# Schools
+nutzareal <- st_as_sf(st_read(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_NUTZUNGSAREAL.shp")))
+nutzareal <- st_zm(nutzareal, drop = TRUE, what = "ZM") %>% st_transform(crs = 2056) # drop Z dimension
+schools_info <- read.dbf(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_SCHULE.dbf"))
+schools_relation <- read.dbf(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_NUTZUNGSAREAL_SCHULE.dbf"))
+
+# Hobbies: Freizeitanlagenareal, Schwimmbadareal, Sportplatzareal, Zooareal
+hobbies <- st_as_sf(st_read(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_FREIZEITAREAL.shp")))
+hobbies <- st_zm(hobbies, drop = TRUE, what = "ZM") %>% st_transform(crs = 2056) # drop Z dimension
+hobbies$weight <- st_area(hobbies) # use area as weight
+hobbies <- hobbies %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% st_centroid()
+hobbies <- hobbies %>% filter(OBJEKTART %in% c("Freizeitanlagenareal", "Schwimmbadareal", "Sportplatzareal","Zooareal"))
+# hobbies <- hobbies %>% dplyr::select("geometry")
+
+# Hospitals
+hospitals <- nutzareal %>% filter(OBJEKTART == "Spitalareal")
+hospitals <- hospitals %>% # group by ARE NAME
+  dplyr::group_by(ARE_NAME_U) %>% 
+  dplyr::summarise(geometry = st_union(geometry), NAME = first(NAME))
+hospitals$weight <- st_area(hospitals) # area as weight
+hospitals <- hospitals %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% filter(drop_units(weight) > 4000) %>% st_centroid() # keep only hospitals with area > 5000 m2
+# hospitals <- hospitals %>% dplyr::select("geometry")
+
+# Public parks
+parks <- nutzareal %>% filter(OBJEKTART == "Oeffentliches Parkareal")
+parks$weight <- st_area(parks) # area as weight
+parks <- parks %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% filter(drop_units(weight) > 2000) %>% st_centroid() # keep only parks > 2500 m2
+# parks <- parks %>% dplyr::select("geometry")
+
+# Supermarkets and convenience stores: OSM
+pois <- st_as_sf(st_read(file.path(dataFolder, "osm_ch/gis_osm_pois_free_1.shp"))) %>% st_transform(crs = 2056) %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056))
+pois_area <- st_as_sf(st_read(file.path(dataFolder, "osm_ch/gis_osm_pois_a_free_1.shp"))) %>% st_transform(crs = 2056) %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% st_centroid()
+con_p <- pois %>% filter(fclass == "convenience")
+con_a <- pois_area %>% filter(fclass == "convenience")
+convenience <- rbind(con_p, con_a)
+
+supermarkets_p <- pois %>% filter(fclass == "supermarket")
+supermarkets_a <- pois_area %>% filter(fclass == "supermarket")
+supermarkets <- rbind(supermarkets_p, supermarkets_a)
+
+stores <- rbind(supermarkets) # only consider grocery stores
+stores$weight <- 1 # weight 1 for every grocery store
+# stores <- stores %>% dplyr::select("geometry")
+
+# Population data
+statpop_ch <- read.csv(file.path(dataFolder, "STATPOP2022/STATPOP2022.csv"), sep = ";")
+statpop_ch <- statpop_ch %>% # take center of each hectare raster cell
+  mutate(E_KOORD = E_KOORD + 50,
+         N_KOORD = N_KOORD + 50)
+statpop_ch <- st_as_sf(x = statpop_ch, coords = c("E_KOORD", "N_KOORD"), crs = 2056)
+statpop_ch <- statpop_ch %>% dplyr::select(B22BTOT)
+statpop <- st_filter(statpop_ch, communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) # populated hectare raster
+```
+
+```{r}
+# Raster for destinations with cellsize of 200m
+grid <- st_make_grid(border, cellsize = 200, what = "centers", crs = 2056) %>% st_intersection(border) %>% st_as_sf() %>% st_zm(drop = TRUE, what = "ZM")
+st_geometry(grid) <- "geometry"
+```
+
+```{r}
+# Map train stations
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(train_stat) + tm_dots() 
+```
+
+```{r}
+schools <- nutzareal %>% filter(OBJEKTART == "Schul- und Hochschulareal")
+schools <- st_filter(schools, communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056))
+schools <- left_join(schools, schools_relation, by = c("UUID" = "NUTZ_U"))
+schools <- left_join(schools, schools_info, by = c("SCHULE_U" = "UUID"))
+schools <- schools %>% filter(ISCED_STUF %in% c("ISCED 2", "ISCED 3")) # filter to Sekundarstufe 1 und 2, auch ub und KW checken
+schools$weight <- st_area(schools)
+schools <- st_centroid(schools)
+# schools <- schools %>% dplyr::select("geometry")
+```
+
+```{r}
+# Map schools
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(schools) + tm_dots() 
+```
+
+```{r}
+# # Universitäten, Fachhochschulen und Höhere Fachschulen: Not considered
+# nutzareal <- st_as_sf(st_read(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_NUTZUNGSAREAL.shp")))
+# nutzareal <- st_zm(nutzareal, drop = TRUE, what = "ZM") %>% st_transform(crs = 2056) # drop Z dimension
+# schools_info <- read.dbf(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_SCHULE.dbf"))
+# schools_relation <- read.dbf(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_NUTZUNGSAREAL_SCHULE.dbf"))
+# 
+# schools <- nutzareal %>% filter(OBJEKTART == "Schul- und Hochschulareal")
+# schools <- st_filter(schools, border)
+# schools <- left_join(schools, schools_relation, by = c("UUID" = "NUTZ_U"))
+# schools <- left_join(schools, schools_info, by = c("SCHULE_U" = "UUID"))
+# test <- schools %>% filter(ISCED_STUF %in% c("ISCED 5")) # filter to tertiärer Bildungsbereich
+# # schools <- st_centroid(schools)
+# # schools <- schools %>% dplyr::select("geometry")
+```
+
+```{r}
+# # Map schools
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") +
+# tm_shape(test) + tm_polygons() 
+```
+
+```{r}
+# Map hobbies
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(hobbies) + tm_dots() 
+```
+
+```{r}
+# Map hospitals
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(hospitals) + tm_dots() 
+```
+
+```{r}
+# Map parks
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(parks) + tm_dots() 
+```
+
+```{r}
+# Map supermarkets
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(stores) + tm_dots()
+```
+
+## Overview: Number of destinations per raster point
+```{r}
+# Merge different types of destinations
+train_stat <- train_stat %>%
+  mutate(type = "Train station")
+schools <- schools %>%
+  mutate(type = "School")
+stores <- stores %>%
+  mutate(type = "Grocery stores")
+parks <- parks %>%
+  mutate(type = "Public parks")
+hobbies <- hobbies %>%
+  mutate(type = "Leisure and sports facilities")
+hospitals <- hospitals %>%
+  mutate(type = "Hospital")
+
+destinations <- rbind(train_stat %>% dplyr::select(geometry,type), schools %>% dplyr::select(geometry,type), stores %>% dplyr::select(geometry,type), parks %>% dplyr::select(geometry,type), 
+                      hobbies %>% dplyr::select(geometry,type), hospitals %>% dplyr::select(geometry,type))
+nrow(destinations)
+```
+
+```{r}
+# Count number of destinations per grid point
+count_points_per <- function(points_to_count, count_per){
+  points_to_count <- points_to_count %>%
+    mutate(nearest_point = st_nearest_feature(points_to_count, count_per)
+    )
+
+  points_to_count_count <- points_to_count %>%
+    dplyr::group_by(nearest_point) %>%
+    dplyr::count() %>%
+    st_drop_geometry()
+
+  count_per <- count_per %>%
+    dplyr::mutate(id = row_number()
+  )
+
+  num_per_point <- left_join(count_per, points_to_count_count, by = c("id" = "nearest_point")) %>%
+    dplyr::select(id, n)
+
+  num_per_point$n[is.na(num_per_point$n)] <- 0 # replace NA values with 0
+  return(num_per_point)
+}
+
+grid <- count_points_per(destinations, grid)
+```
+
+```{r}
+# Summary of number of destinations per grid point
+summary(grid$n) # summary statistics of all grid points
+summary(grid %>% filter(n > 0) %>% dplyr::select(n)) # summary statistics of grid points with at least one destination
+```
+
+Most points do not have any destination and those which have, mostly have one assigned. Let's therefore work with single POIs.
+
+```{r}
+# Map number of destinations per grid point
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(grid) + tm_dots(col = "n") #+
+# tm_shape(destinations) + tm_dots(col = "red")
+```
+
+```{r}
+# # Function to find nearest network node for a given point
+find_nearest_node <- function(points, nodes){
+  points %>%
+  mutate(
+    index_of_nearest_feature = st_nearest_feature(., nodes),
+    nearest_feature = st_geometry(nodes[index_of_nearest_feature,]),
+    nearest_point = purrr::pmap(
+      list(geometry, nearest_feature),
+      ~ st_nearest_points(.x, .y) %>% st_cast("POINT") %>% magrittr::extract2(2)
+    )
+  ) %>%
+  pull(nearest_point) %>%
+  st_sfc(crs = 2056)
+}
+
+nearest_point <- find_nearest_node(destinations, grid)
+summary(st_distance(destinations, nearest_point, by_element = TRUE))
+
+# Distance into network for population and destination points
+nodes_tibble <- network %N>%
+  as_tibble()
+nodes_tibble <- st_as_sf(nodes_tibble, sf_column_name = "geometry")
+
+nearest_point_dest <- find_nearest_node(destinations, nodes_tibble)
+nearest_point_pop <- find_nearest_node(statpop, nodes_tibble)
+
+distances_dest_ls <- st_distance(destinations, nearest_point_dest, by_element = TRUE)
+distances_pop_ls <- st_distance(statpop, nearest_point_pop, by_element = TRUE)
+
+hist(distances_dest_ls, xlab = "Distance [m]", freq = TRUE, main = "Distance into network for destination points")
+hist(distances_pop_ls, xlab = "Distance [m]", freq = TRUE, main = "Distance into network for population points")
+```
+
+
+## Test routing
+```{r}
+# Look at a random shortest perceived path (without costs of accidents)
+set.seed(44)
+path_per <- st_network_paths(network, from = statpop[runif(1, min = 1, max = nrow(statpop)), ], to = train_stat[runif(1, min = 1, max = nrow(train_stat)), ], weights = "perceived_dist_no_acc")
+path_per
+
+nodes_path_per <- path_per %>%
+  pull(node_paths) %>%
+  unlist() %>% as.numeric()
+start_node_per <- network %N>% st_as_sf() %>% slice(nodes_path_per[1])
+end_node_per <- network %N>% st_as_sf() %>% slice(nodes_path_per[length(nodes_path_per)])
+print(c(start_node_per$geometry, end_node_per$geometry))
+
+path_net_per <- network %N>%
+  slice(path_per %>% pull(node_paths) %>% unlist())
+print(sum(st_length(st_as_sf(path_net_per %>% activate("edges")))))
+```
+
+```{r}
+# Look at a random shortest path
+set.seed(44)
+path <- st_network_paths(network, from = statpop[runif(1, min = 1, max = nrow(statpop)), ], to = train_stat[runif(1, min = 1, max = nrow(train_stat)), ], weights = "weight")
+path
+
+nodes_path <- path %>%
+  pull(node_paths) %>%
+  unlist() %>% as.numeric()
+start_node <- network %N>% st_as_sf() %>% slice(nodes_path[1])
+end_node <- network %N>% st_as_sf() %>% slice(nodes_path[length(nodes_path)])
+print(c(start_node$geometry, end_node$geometry))
+
+path_net <- network %N>%
+  slice(path %>% pull(node_paths) %>% unlist())
+print(sum(st_length(st_as_sf(path_net %>% activate("edges")))))
+
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines(alpha = 0.4) +
+tm_shape(st_as_sf(path_net_per %>% activate("edges"))) + tm_lines(col = "green") +
+tm_shape(st_as_sf(path_net %>% activate("edges"))) + tm_lines(col = "red")
+```
+
+
+## Calculate bikeability
+### For each destination type separately
+```{r}
+nodes_tibble <- network %N>%
+  as_tibble()
+nodes_tibble <- st_as_sf(nodes_tibble, sf_column_name = "geometry")
+
+nearest_nodes_pop <- find_nearest_node(statpop, nodes_tibble)
+
+summary_nearest_node <- function(points){ # point dataset as input
+  nearest_nodes_desttype <- find_nearest_node(points, nodes_tibble)
+  summary(st_distance(points, nearest_nodes_desttype, by_element = TRUE))
+}
+
+# Distances of population points to nearest node in network
+summary_nearest_node(statpop)
+
+# Distances of destination points to nearest node in network
+summary_nearest_node(train_stat)
+summary_nearest_node(schools)
+summary_nearest_node(stores)
+summary_nearest_node(hospitals)
+summary_nearest_node(parks)
+summary_nearest_node(hobbies)
+
+# # Have a look at every single observation or maximum distance
+# st_distance(schools, nearest_nodes_desttype, by_element = TRUE)
+# which.max(st_distance(statpop, nearest_nodes_pop, by_element = TRUE))
+```
+
+```{r}
+# Function to calculate mean bikeability (accessibility) for each population point using an exponential distance weighting function and destination weights
+calcAccessibility_weighted <- function(desttype, dmax, beta, cost_string){
+  # inputs: desttype are destinations as points, dmax in meters, beta parameter of exponential function and cost variable as string
+  nearest_nodes_desttype <- find_nearest_node(desttype, nodes_tibble)
+  destinations_weights <- desttype$weight
+  cost_mat_real <- st_network_cost(network, from = nearest_nodes_pop, to = nearest_nodes_desttype, weights = "weight") # cost matrix using geographical distances
+  cost_mat <- st_network_cost(network, from = nearest_nodes_pop, to = nearest_nodes_desttype, weights = cost_string) # get cost matrix of shortest paths using cost distances
+  cost_mat <- as.data.frame(cost_mat)
+  cost_mat <- drop_units(cost_mat)
+
+  accessibility <- rep(NA, nrow(cost_mat))
+  for(i in 1:nrow(cost_mat)){
+    dists_within_dmax <- cost_mat[i, cost_mat_real[i, ] <= dmax] # select those distances below dmax
+    weights_within_dmax <- destinations_weights[cost_mat_real[i, ] <= dmax]
+    dists_within_dmax <- as.numeric(dists_within_dmax)
+    imps_within_dmax <- weights_within_dmax * exp(-beta * dists_within_dmax) # exponential distance weighting function
+    avg_within_dmax <- sum(imps_within_dmax) / sum(weights_within_dmax) # take mean value
+
+    accessibility[i] <- avg_within_dmax
+
+    accessibility[i] <- ifelse(is.na(accessibility[i]), 0, accessibility[i])
+  }
+  return(accessibility)
+}
+```
+
+```{r}
+# Function to calculate mean bikeability (accessibility) for each population point using an exponential distance weighting function and no destination weights
+calcAccessibility_unweighted <- function(desttype, dmax, beta, cost_string){
+  # inputs: desttype are destinations as points, dmax in meters, beta parameter of exponential function and cost variable as string
+  nearest_nodes_desttype <- find_nearest_node(desttype, nodes_tibble)
+  cost_mat_real <- st_network_cost(network, from = nearest_nodes_pop, to = nearest_nodes_desttype, weights = "weight") # cost matrix
+  cost_mat <- st_network_cost(network, from = nearest_nodes_pop, to = nearest_nodes_desttype, weights = cost_string) # get cost matrix of shortest paths
+  cost_mat <- as.data.frame(cost_mat)
+  cost_mat <- drop_units(cost_mat)
+
+  accessibility <- rep(NA, nrow(cost_mat))
+  for(i in 1:nrow(cost_mat)){
+    dists_within_dmax <- cost_mat[i, cost_mat_real[i, ] <= dmax] # select those distances below dmax
+    dists_within_dmax <- as.numeric(dists_within_dmax)
+    imps_within_dmax <- exp(-beta * dists_within_dmax) # exponential distance weighting function
+    avg_within_dmax <- mean(imps_within_dmax) # take mean value
+
+    accessibility[i] <- avg_within_dmax
+
+    accessibility[i] <- ifelse(is.na(accessibility[i]), 0, accessibility[i])
+  }
+  return(accessibility)
+}
+```
+
+#### Using real geographical distances
+```{r}
+# Beta, such that at 4 km the score is equal to 0.2
+beta_calc2 <- -(log(0.1) / 4000)
+beta_calc <- -(log(0.2) / 4000)
+plot(seq(0, 4000, 0.01), exp(-beta_calc * seq(0, 4000, 0.01)), type = "l", col = "blue", xlab = "Distance", ylab = "Score")
+lines(seq(0, 4000, 0.01), exp(-beta_calc2 * seq(0, 4000, 0.01)), type = "l", col = "red", xlab = "Distance", ylab = "Score")
+lines(seq(0, 4000, 0.01), exp(-0.0006 * seq(0, 4000, 0.01)), type = "l", col = "green", xlab = "Distance", ylab = "Score")
+```
+
+```{r}
+# Using real geographical distances
+beta_value <- beta_calc # beta value for all types of destinations
+dmax <- 4000
+statpop[ , paste0("acc_","train_stat_","real")] <- calcAccessibility_weighted(train_stat, dmax, beta_value, "weight") 
+statpop[ , paste0("acc_","schools_","real")] <- calcAccessibility_unweighted(schools, dmax, beta_value, "weight") 
+statpop[ , paste0("acc_","stores_","real")] <- calcAccessibility_unweighted(stores, dmax, beta_value, "weight") 
+statpop[ , paste0("acc_","hospitals_","real")] <- calcAccessibility_unweighted(hospitals, dmax, beta_value, "weight") 
+statpop[ , paste0("acc_","parks_","real")] <- calcAccessibility_unweighted(parks, dmax, beta_value, "weight")
+statpop[ , paste0("acc_","hobbies_","real")] <- calcAccessibility_unweighted(hobbies, dmax, beta_value, "weight")
+```
+
+```{r}
+# Summary statistics of accessibility values
+summary(statpop$acc_train_stat_real)
+summary(statpop$acc_schools_real)
+summary(statpop$acc_stores_real)
+summary(statpop$acc_hospitals_real)
+summary(statpop$acc_parks_real)
+summary(statpop$acc_hobbies_real)
+```
+
+```{r}
+# Define function to plot bikeability quartiles for a single destination type
+plot_quartiles <- function(acc_desttype, typename){ # acccessibility of destination type and typename as string
+  statpop <- statpop %>%
+    mutate(quantile=ntile(acc_desttype, 4))
+  ggplot() + 
+    geom_sf(data = statpop, aes(col=as.factor(quantile)), size = 0.5) +
+    scale_color_manual(values=c("#132B43", "#28547A", "#3E81B7", "#56B1F7")) +
+    # geom_sf(data = desttype, aes(fill = typename), col = "red", shape = 17, size = 2.5) +
+    coord_sf(datum = 2056) +
+    theme_void() +
+    labs(title = paste("Accessibility to", typename), colour="Accessibility quartile", fill="") +
+    guides(colour = guide_legend(override.aes = list(size=4)))
+}
+```
+
+```{r}
+# Define function to plot continuous bikeability values for a single destination type
+plot_cont <- function(acc_desttype, typename){ # acccessibility of destination type and typename as string
+  ggplot() + 
+    geom_sf(data = statpop, aes(col=acc_desttype), size = 0.5) +
+    scale_color_binned() +
+    # scale_color_viridis_b() +
+    # geom_sf(data = train_stat, aes(fill = "Badis"), col = "red", shape = 17, size = 2.5) +
+    coord_sf(datum = 2056) +
+    theme_void() +
+    labs(title = paste("Accessibility to", typename), colour="Accessibility", fill="")
+}
+```
+
+```{r}
+# Plot bikeability quartiles
+plot_quartiles(statpop$acc_train_stat_real, "train stations")
+plot_quartiles(statpop$acc_schools_real, "schools")
+plot_quartiles(statpop$acc_stores_real, "stores")
+plot_quartiles(statpop$acc_hospitals_real, "hospitals")
+plot_quartiles(statpop$acc_parks_real, "parks")
+plot_quartiles(statpop$acc_hobbies_real, "hobbies")
+```
+
+```{r}
+# # Plot continuous bikeability values
+# plot_cont(statpop$acc_train_stat_real, "train stations")
+# plot_cont(statpop$acc_schools_real, "schools")
+# plot_cont(statpop$acc_stores_real, "stores")
+# plot_cont(statpop$acc_hospitals_real, "hospitals")
+# plot_cont(statpop$acc_parks_real, "parks")
+# plot_cont(statpop$acc_hobbies_real, "hobbies")
+```
+
+```{r}
+# Aggregate bikeability values to one single bikeability measure
+weight_stores <- 0.7/2.15 # 0.253
+weight_schools <- 0.2/2.15 # 0.077
+weight_parks_hobbies <- 1.0/2.15 # 0.366
+weight_hospitals <- 0.05/2.15 # 0.035
+weight_train_stat <- 0.2/2.15 # 1 - weight_stores - weight_schools - weight_parks_hobbies - weight_hospitals
+
+statpop <- statpop %>%
+  dplyr::mutate(acc_tot_real = weight_train_stat * acc_train_stat_real + weight_schools * acc_schools_real + weight_stores * acc_stores_real + weight_hospitals * acc_hospitals_real + (weight_parks_hobbies/2)*(acc_parks_real + acc_hobbies_real))
+
+# Distribution of total bikeability values
+summary(statpop$acc_tot_real)
+```
+
+```{r}
+# Plot aggregate BA index
+plot_quartiles(statpop$acc_tot_real, "all destinations")
+```
+
+```{r}
+# plot_cont(statpop$acc_tot_real, "all destinations")
+```
+
+#### Using perceived distances (including number of accidents)
+```{r}
+# Using perveived distances
+statpop[ , paste0("acc_","train_stat_","per")] <- calcAccessibility_weighted(train_stat, dmax, beta_value, "perceived_dist")
+statpop[ , paste0("acc_","schools_","per")] <- calcAccessibility_unweighted(schools, dmax, beta_value, "perceived_dist")
+statpop[ , paste0("acc_","stores_","per")] <- calcAccessibility_unweighted(stores, dmax, beta_value, "perceived_dist")
+statpop[ , paste0("acc_","hospitals_","per")] <- calcAccessibility_unweighted(hospitals, dmax, beta_value, "perceived_dist")
+statpop[ , paste0("acc_","parks_","per")] <- calcAccessibility_unweighted(parks, dmax, beta_value, "perceived_dist")
+statpop[ , paste0("acc_","hobbies_","per")] <- calcAccessibility_unweighted(hobbies, dmax, beta_value, "perceived_dist")
+```
+
+```{r}
+# Summary statistics of accessibility values
+summary(statpop$acc_train_stat_per)
+summary(statpop$acc_schools_per)
+summary(statpop$acc_stores_per)
+summary(statpop$acc_hospitals_per)
+summary(statpop$acc_parks_per)
+summary(statpop$acc_hobbies_per)
+```
+
+```{r}
+# Plot bikeability quartiles
+plot_quartiles(statpop$acc_train_stat_per, "train stations")
+plot_quartiles(statpop$acc_schools_per, "schools")
+plot_quartiles(statpop$acc_stores_per, "stores")
+plot_quartiles(statpop$acc_hospitals_per, "hospitals")
+plot_quartiles(statpop$acc_parks_per, "parks")
+plot_quartiles(statpop$acc_hobbies_per, "hobbies")
+```
+
+```{r}
+# # Plot continuous bikeability values
+# plot_cont(statpop$acc_train_stat_per, "train stations")
+# plot_cont(statpop$acc_schools_per, "schools")
+# plot_cont(statpop$acc_stores_per, "stores")
+# plot_cont(statpop$acc_hospitals_per, "hospitals")
+# plot_cont(statpop$acc_parks_per, "parks")
+# plot_cont(statpop$acc_hobbies_per, "hobbies")
+```
+
+```{r}
+# Aggregate bikability values to one single bikeability measure
+statpop <- statpop %>%
+  dplyr::mutate(acc_tot_per = weight_train_stat * acc_train_stat_per + weight_schools * acc_schools_per + weight_stores * acc_stores_per + weight_hospitals * acc_hospitals_per + (weight_parks_hobbies/2)*(acc_parks_per + acc_hobbies_per))
+
+# Distribution of total bikeability values
+summary(statpop$acc_tot_per)
+```
+
+```{r}
+# Plot aggregate BA index
+plot_quartiles(statpop$acc_tot_per, "all destinations")
+```
+
+```{r}
+# plot_cont(statpop$acc_tot_per, "all destinations")
+```
+
+#### Exclude accidents
+```{r}
+# Using perveived distances without accidents
+statpop[ , paste0("acc_","train_stat_","noacc")] <- calcAccessibility_weighted(train_stat, dmax, beta_value, "perceived_dist_no_acc")
+statpop[ , paste0("acc_","schools_","noacc")] <- calcAccessibility_unweighted(schools, dmax, beta_value, "perceived_dist_no_acc")
+statpop[ , paste0("acc_","stores_","noacc")] <- calcAccessibility_unweighted(stores, dmax, beta_value, "perceived_dist_no_acc")
+statpop[ , paste0("acc_","hospitals_","noacc")] <- calcAccessibility_unweighted(hospitals, dmax, beta_value, "perceived_dist_no_acc")
+statpop[ , paste0("acc_","parks_","noacc")] <- calcAccessibility_unweighted(parks, dmax, beta_value, "perceived_dist_no_acc")
+statpop[ , paste0("acc_","hobbies_","noacc")] <- calcAccessibility_unweighted(hobbies, dmax, beta_value, "perceived_dist_no_acc")
+```
+
+```{r}
+# Summary statistics of accessibility values
+summary(statpop$acc_train_stat_noacc)
+summary(statpop$acc_schools_noacc)
+summary(statpop$acc_stores_noacc)
+summary(statpop$acc_hospitals_noacc)
+summary(statpop$acc_parks_noacc)
+summary(statpop$acc_hobbies_noacc)
+```
+
+```{r}
+# Plot bikeability quartiles
+plot_quartiles(statpop$acc_train_stat_noacc, "train stations")
+plot_quartiles(statpop$acc_schools_noacc, "schools")
+plot_quartiles(statpop$acc_stores_noacc, "stores")
+plot_quartiles(statpop$acc_hospitals_noacc, "hospitals")
+plot_quartiles(statpop$acc_parks_noacc, "parks")
+plot_quartiles(statpop$acc_hobbies_noacc, "hobbies")
+```
+
+```{r}
+# # Plot continuous bikeability values
+# plot_cont(statpop$acc_train_stat_noacc, "train stations")
+# plot_cont(statpop$acc_schools_noacc, "schools")
+# plot_cont(statpop$acc_stores_noacc, "stores")
+# plot_cont(statpop$acc_hospitals_noacc, "hospitals")
+# plot_cont(statpop$acc_parks_noacc, "parks")
+# plot_cont(statpop$acc_hobbies_noacc, "hobbies")
+```
+
+```{r}
+# Aggregate bikability values to one single bikeability measure
+statpop <- statpop %>%
+  dplyr::mutate(acc_tot_noacc = weight_train_stat * acc_train_stat_noacc + weight_schools * acc_schools_noacc + weight_stores * acc_stores_noacc + weight_hospitals * acc_hospitals_noacc + (weight_parks_hobbies/2)*(acc_parks_noacc + acc_hobbies_noacc))
+
+# Distribution of total bikeability values
+summary(statpop$acc_tot_noacc)
+```
+
+```{r}
+# Plot aggregate BA index
+plot_quartiles(statpop$acc_tot_noacc, "all destinations")
+```
+
+```{r}
+# plot_cont(statpop$acc_tot_noacc, "all destinations")
+```
+
+#### Consider only BLOS and green and aquatic areas
+```{r}
+network <- network %E>%
+  mutate(perceived_blos_green = (1 + cost_suitability - benefit_greenaquatic) * weight)
+
+# Using perveived distances without accidents
+statpop[ , paste0("acc_","train_stat_","blos_green")] <- calcAccessibility_weighted(train_stat, dmax, beta_value, "perceived_blos_green")
+statpop[ , paste0("acc_","schools_","blos_green")] <- calcAccessibility_unweighted(schools, dmax, beta_value, "perceived_blos_green")
+statpop[ , paste0("acc_","stores_","blos_green")] <- calcAccessibility_unweighted(stores, dmax, beta_value, "perceived_blos_green")
+statpop[ , paste0("acc_","hospitals_","blos_green")] <- calcAccessibility_unweighted(hospitals, dmax, beta_value, "perceived_blos_green")
+statpop[ , paste0("acc_","parks_","blos_green")] <- calcAccessibility_unweighted(parks, dmax, beta_value, "perceived_blos_green")
+statpop[ , paste0("acc_","hobbies_","blos_green")] <- calcAccessibility_unweighted(hobbies, dmax, beta_value, "perceived_blos_green")
+```
+
+```{r}
+# Summary statistics of accessibility values
+summary(statpop$acc_train_stat_blos_green)
+summary(statpop$acc_schools_blos_green)
+summary(statpop$acc_stores_blos_green)
+summary(statpop$acc_hospitals_blos_green)
+summary(statpop$acc_parks_blos_green)
+summary(statpop$acc_hobbies_blos_green)
+```
+
+```{r}
+# Plot bikeability quartiles
+plot_quartiles(statpop$acc_train_stat_blos_green, "train stations")
+plot_quartiles(statpop$acc_schools_blos_green, "schools")
+plot_quartiles(statpop$acc_stores_blos_green, "stores")
+plot_quartiles(statpop$acc_hospitals_blos_green, "hospitals")
+plot_quartiles(statpop$acc_parks_blos_green, "parks")
+plot_quartiles(statpop$acc_hobbies_blos_green, "hobbies")
+```
+
+```{r}
+# # Plot continuous bikeability values
+# plot_cont(statpop$acc_train_stat_blos_green, "train stations")
+# plot_cont(statpop$acc_schools_blos_green, "schools")
+# plot_cont(statpop$acc_stores_blos_green, "stores")
+# plot_cont(statpop$acc_hospitals_blos_green, "hospitals")
+# plot_cont(statpop$acc_parks_blos_green, "parks")
+# plot_cont(statpop$acc_hobbies_blos_green, "hobbies")
+```
+
+```{r}
+# Aggregate bikability values to one single bikeability measure
+statpop <- statpop %>%
+  dplyr::mutate(acc_tot_blos_green = weight_train_stat * acc_train_stat_blos_green + weight_schools * acc_schools_blos_green + weight_stores * acc_stores_blos_green + weight_hospitals * acc_hospitals_blos_green + (weight_parks_hobbies/2)*(acc_parks_blos_green + acc_hobbies_blos_green))
+
+# Distribution of total bikeability values
+summary(statpop$acc_tot_blos_green)
+```
+
+```{r}
+# Plot aggregate BA index
+plot_quartiles(statpop$acc_tot_blos_green, "all destinations")
+```
+
+```{r}
+# plot_cont(statpop$acc_tot_blos_green, "all destinations")
+```
+
+#### Using perceived distances, considering only BLOS
+```{r}
+# Using perveived distances, considering only BLOS
+statpop[ , paste0("acc_","train_stat_","blos")] <- calcAccessibility_weighted(train_stat, dmax, beta_value, "perceived_dist_suit")
+statpop[ , paste0("acc_","schools_","blos")] <- calcAccessibility_weighted(schools, dmax, beta_value, "perceived_dist_suit")
+statpop[ , paste0("acc_","stores_","blos")] <- calcAccessibility_weighted(stores, dmax, beta_value, "perceived_dist_suit")
+statpop[ , paste0("acc_","hospitals_","blos")] <- calcAccessibility_weighted(hospitals, dmax, beta_value, "perceived_dist_suit")
+statpop[ , paste0("acc_","parks_","blos")] <- calcAccessibility_weighted(parks, dmax, beta_value, "perceived_dist_suit")
+statpop[ , paste0("acc_","hobbies_","blos")] <- calcAccessibility_weighted(hobbies, dmax, beta_value, "perceived_dist_suit")
+```
+
+```{r}
+# Summary statistics of accessibility values
+summary(statpop$acc_train_stat_blos)
+summary(statpop$acc_schools_blos)
+summary(statpop$acc_stores_blos)
+summary(statpop$acc_hospitals_blos)
+summary(statpop$acc_parks_blos)
+summary(statpop$acc_hobbies_blos)
+```
+
+```{r}
+# Plot bikeability quartiles
+plot_quartiles(statpop$acc_train_stat_blos, "train stations")
+plot_quartiles(statpop$acc_schools_blos, "schools")
+plot_quartiles(statpop$acc_stores_blos, "stores")
+plot_quartiles(statpop$acc_hospitals_blos, "hospitals")
+plot_quartiles(statpop$acc_parks_blos, "parks")
+plot_quartiles(statpop$acc_hobbies_blos, "hobbies")
+```
+
+```{r}
+# # Plot continuous bikeability values
+# plot_cont(statpop$acc_train_stat_blos, "train stations")
+# plot_cont(statpop$acc_schools_blos, "schools")
+# plot_cont(statpop$acc_stores_blos, "stores")
+# plot_cont(statpop$acc_hospitals_blos, "hospitals")
+# plot_cont(statpop$acc_parks_blos, "parks")
+# plot_cont(statpop$acc_hobbies_blos, "hobbies")
+```
+
+```{r}
+# Aggregate bikability values to one single bikeability measure
+statpop <- statpop %>%
+  dplyr::mutate(acc_tot_blos = weight_train_stat * acc_train_stat_blos + weight_schools * acc_schools_blos + weight_stores * acc_stores_blos + weight_hospitals * acc_hospitals_blos + (weight_parks_hobbies/2)*(acc_parks_blos + acc_hobbies_blos))
+
+# Distribution of total bikeability values
+summary(statpop$acc_tot_blos)
+```
+
+```{r}
+# Plot aggregate BA index
+plot_quartiles(statpop$acc_tot_blos, "all destinations")
+```
+
+```{r}
+# plot_cont(statpop$acc_tot_blos, "all destinations")
+```
+
+
+#### Difference between real and perceived
+```{r}
+# Absolute difference
+statpop$acc_train_stat_diff <- statpop$acc_train_stat_per - statpop$acc_train_stat_real
+statpop$acc_schools_diff <- statpop$acc_schools_per - statpop$acc_schools_real
+statpop$acc_stores_diff <- statpop$acc_stores_per - statpop$acc_stores_real
+statpop$acc_hospitals_diff <- statpop$acc_hospitals_per - statpop$acc_hospitals_real
+statpop$acc_parks_diff <- statpop$acc_parks_per - statpop$acc_parks_real
+statpop$acc_hobbies_diff <- statpop$acc_hobbies_per - statpop$acc_hobbies_real
+
+statpop$acc_tot_diff <- statpop$acc_tot_per - statpop$acc_tot_real
+hist(statpop$acc_tot_diff, prob = T, xlab = "Absolute difference")
+```
+
+```{r}
+# Summary statistics of difference
+summary(statpop$acc_train_stat_diff)
+summary(statpop$acc_schools_diff)
+summary(statpop$acc_stores_diff)
+summary(statpop$acc_hospitals_diff)
+summary(statpop$acc_parks_diff)
+summary(statpop$acc_hobbies_diff)
+
+summary(statpop$acc_tot_diff)
+```
+
+```{r}
+# Relative difference
+statpop$acc_train_stat_diff_rel <- (statpop$acc_train_stat_per - statpop$acc_train_stat_real) / statpop$acc_train_stat_real
+statpop$acc_schools_diff_rel <- (statpop$acc_schools_per - statpop$acc_schools_real) / statpop$acc_schools_real
+statpop$acc_stores_diff_rel <- (statpop$acc_stores_per - statpop$acc_stores_real) / statpop$acc_stores_real
+statpop$acc_hospitals_diff_rel <- (statpop$acc_hospitals_per - statpop$acc_hospitals_real) / statpop$acc_hospitals_real
+statpop$acc_parks_diff_rel <- (statpop$acc_parks_per - statpop$acc_parks_real) / statpop$acc_parks_real
+statpop$acc_hobbies_diff_rel <- (statpop$acc_hobbies_per - statpop$acc_hobbies_real) / statpop$acc_hobbies_real
+
+statpop$acc_tot_diff_rel <- (statpop$acc_tot_per - statpop$acc_tot_real) / statpop$acc_tot_real
+
+statpop <- statpop %>% 
+  mutate(acc_train_stat_diff_rel = ifelse(is.na(acc_train_stat_diff_rel) & acc_train_stat_per == 0.0, 0, ifelse(is.na(acc_train_stat_diff_rel) & acc_train_stat_per > 0.0, 1, acc_train_stat_diff_rel)),
+         acc_schools_diff_rel = ifelse(is.na(acc_schools_diff_rel) & acc_schools_per == 0.0, 0, ifelse(is.na(acc_schools_diff_rel) & acc_schools_per > 0.0, 1, acc_schools_diff_rel)),
+         acc_stores_diff_rel = ifelse(is.na(acc_stores_diff_rel) & acc_stores_per == 0.0, 0, ifelse(is.na(acc_stores_diff_rel) & acc_stores_per > 0.0, 1, acc_stores_diff_rel)),
+         acc_hospitals_diff_rel = ifelse(is.na(acc_hospitals_diff_rel) & acc_hospitals_per == 0.0, 0, ifelse(is.na(acc_hospitals_diff_rel) & acc_hospitals_per > 0.0, 1, acc_hospitals_diff_rel)),
+         acc_parks_diff_rel = ifelse(is.na(acc_parks_diff_rel) & acc_parks_per == 0.0, 0, ifelse(is.na(acc_parks_diff_rel) & acc_parks_per > 0.0, 1, acc_parks_diff_rel)),
+         acc_hobbies_diff_rel = ifelse(is.na(acc_hobbies_diff_rel) & acc_hobbies_per == 0.0, 0, ifelse(is.na(acc_hobbies_diff_rel) & acc_hobbies_per > 0.0, 1, acc_hobbies_diff_rel)),
+         acc_tot_diff_rel = ifelse(is.na(acc_tot_diff_rel) & acc_tot_per == 0.0, 0, ifelse(is.na(acc_tot_diff_rel) & acc_tot_per > 0.0, 1, acc_tot_diff_rel))
+  )
+
+hist(statpop$acc_tot_diff_rel, prob = T, xlab = "Relative difference")
+```
+
+```{r}
+# Summary statistics of difference
+summary(statpop$acc_train_stat_diff_rel)
+summary(statpop$acc_schools_diff_rel)
+summary(statpop$acc_stores_diff_rel)
+summary(statpop$acc_hospitals_diff_rel)
+summary(statpop$acc_parks_diff_rel)
+summary(statpop$acc_hobbies_diff_rel)
+
+summary(statpop$acc_tot_diff_rel)
+```
+
+#### Difference between real and perceived, considering BLOS
+```{r}
+# Absolute difference
+statpop$acc_train_stat_blos_diff <- statpop$acc_train_stat_blos - statpop$acc_train_stat_real
+statpop$acc_schools_blos_diff <- statpop$acc_schools_blos - statpop$acc_schools_real
+statpop$acc_stores_blos_diff <- statpop$acc_stores_blos - statpop$acc_stores_real
+statpop$acc_hospitals_blos_diff <- statpop$acc_hospitals_blos - statpop$acc_hospitals_real
+statpop$acc_parks_blos_diff <- statpop$acc_parks_blos - statpop$acc_parks_real
+statpop$acc_hobbies_blos_diff <- statpop$acc_hobbies_blos - statpop$acc_hobbies_real
+
+statpop$acc_tot_blos_diff <- statpop$acc_tot_blos - statpop$acc_tot_real
+hist(statpop$acc_tot_blos_diff, prob = T, xlab = "Absolute difference")
+```
+
+```{r}
+# Summary statistics of difference
+summary(statpop$acc_train_stat_blos_diff)
+summary(statpop$acc_schools_blos_diff)
+summary(statpop$acc_stores_blos_diff)
+summary(statpop$acc_hospitals_blos_diff)
+summary(statpop$acc_parks_blos_diff)
+summary(statpop$acc_hobbies_blos_diff)
+
+summary(statpop$acc_tot_blos_diff)
+```
+
+```{r}
+# Relative difference
+statpop$acc_train_stat_blos_rel <- (statpop$acc_train_stat_blos - statpop$acc_train_stat_real) / statpop$acc_train_stat_real
+statpop$acc_schools_blos_rel <- (statpop$acc_schools_blos - statpop$acc_schools_real) / statpop$acc_schools_real
+statpop$acc_stores_blos_rel <- (statpop$acc_stores_blos - statpop$acc_stores_real) / statpop$acc_stores_real
+statpop$acc_hospitals_blos_rel <- (statpop$acc_hospitals_blos - statpop$acc_hospitals_real) / statpop$acc_hospitals_real
+statpop$acc_parks_blos_rel <- (statpop$acc_parks_blos - statpop$acc_parks_real) / statpop$acc_parks_real
+statpop$acc_hobbies_blos_rel <- (statpop$acc_hobbies_blos - statpop$acc_hobbies_real) / statpop$acc_hobbies_real
+
+statpop$acc_tot_blos_rel <- (statpop$acc_tot_blos - statpop$acc_tot_real) / statpop$acc_tot_real
+
+statpop <- statpop %>% 
+  mutate(acc_train_stat_blos_rel = ifelse(is.na(acc_train_stat_blos_rel) & acc_train_stat_blos == 0.0, 0, ifelse(is.na(acc_train_stat_blos_rel) & acc_train_stat_blos > 0.0, 1, acc_train_stat_blos_rel)),
+         acc_schools_blos_rel = ifelse(is.na(acc_schools_blos_rel) & acc_schools_blos == 0.0, 0, ifelse(is.na(acc_schools_blos_rel) & acc_schools_blos > 0.0, 1, acc_schools_blos_rel)),
+         acc_stores_blos_rel = ifelse(is.na(acc_stores_blos_rel) & acc_stores_blos == 0.0, 0, ifelse(is.na(acc_stores_blos_rel) & acc_stores_blos > 0.0, 1, acc_stores_blos_rel)),
+         acc_hospitals_blos_rel = ifelse(is.na(acc_hospitals_blos_rel) & acc_hospitals_blos == 0.0, 0, ifelse(is.na(acc_hospitals_blos_rel) & acc_hospitals_blos > 0.0, 1, acc_hospitals_blos_rel)),
+         acc_parks_blos_rel = ifelse(is.na(acc_parks_blos_rel) & acc_parks_blos == 0.0, 0, ifelse(is.na(acc_parks_blos_rel) & acc_parks_blos > 0.0, 1, acc_parks_blos_rel)),
+         acc_hobbies_blos_rel = ifelse(is.na(acc_hobbies_blos_rel) & acc_hobbies_blos == 0.0, 0, ifelse(is.na(acc_hobbies_blos_rel) & acc_hobbies_blos > 0.0, 1, acc_hobbies_blos_rel)),
+         acc_tot_blos_rel = ifelse(is.na(acc_tot_blos_rel) & acc_tot_blos == 0.0, 0, ifelse(is.na(acc_tot_blos_rel) & acc_tot_blos > 0.0, 1, acc_tot_blos_rel))
+  )
+
+hist(statpop$acc_tot_blos_rel, prob = T, xlab = "Relative difference")
+```
+
+```{r}
+# Summary statistics of difference
+summary(statpop$acc_train_stat_blos_rel)
+summary(statpop$acc_schools_blos_rel)
+summary(statpop$acc_stores_blos_rel)
+summary(statpop$acc_hospitals_blos_rel)
+summary(statpop$acc_parks_blos_rel)
+summary(statpop$acc_hobbies_blos_rel)
+
+summary(statpop$acc_tot_blos_rel)
+```
+
+```{r}
+# Export statpop statistics
+coords <- st_coordinates(statpop) %>% data.frame()
+statpop$X <- coords$X
+statpop$Y <- coords$Y
+statpop_df <- statpop %>% st_drop_geometry()
+write_csv(statpop_df, file = file.path(dataFolder, "lausanne/statpop_ls_bikeability.csv"))
+```
+
+
+### Based on number of destinations per grid
+```{r}
+# # Summary statistics of distance of grid point to nearest network node
+# find_nearest_node <- function(points, nodes){
+#   points %>%
+#   mutate(
+#     index_of_nearest_feature = st_nearest_feature(., nodes),
+#     nearest_feature = st_geometry(nodes[index_of_nearest_feature,]),
+#     nearest_point = purrr::pmap(
+#       list(geometry, nearest_feature),
+#       ~ st_nearest_points(.x, .y) %>% st_cast("POINT") %>% magrittr::extract2(2)
+#     ) 
+#   ) %>%
+#   pull(nearest_point) %>%
+#   st_sfc(crs = 2056)
+# }
+# 
+# nearest_node <- find_nearest_node(grid, nodes_tibble)
+# summary(st_distance(grid, nearest_node, by_element = TRUE))
+```
+
+```{r}
+# Filter out grid points above a certain threshold to nearest network node: Assign NA values
+```
+
+```{r}
+# # Calculate mean accessibility for each grid point using an exponential distance weighting function
+# calcAccessibility_grid <- function(grid, dmax, beta, cost_string){ 
+#   # inputs: regular grid, dmax in meters, beta parameter of exponential function and cost variable as string
+#   nearest_nodes_grid <- find_nearest_node(grid, nodes_tibble)
+#   cost_mat <- st_network_cost(network, from = nearest_nodes_grid, to = nearest_nodes_grid, weights = cost_string) # get cost matrix of shortest paths
+#   cost_mat <- as.data.frame(cost_mat)
+#   cost_mat <- drop_units(cost_mat)
+#   # diag(cost_mat) = NA
+#   colnames(cost_mat) <- c(1:ncol(cost_mat))
+#   
+#   accessibility <- rep(NA, nrow(cost_mat))
+#   for(i in 1:nrow(cost_mat)){
+#     dists <- cost_mat %>% dplyr::pull(i)
+#     dists_within_dmax <- dists[dists <= dmax] # select those distances below dmax
+#     dists_within_indices <- which(dists <= dmax) # get indices of points within dmax
+#     imps_within_dmax <- grid$n[dists_within_indices] * exp(-beta_value * dists_within_dmax) # exponential distance weighting function, using number of destinations as weight
+#     avg_within_dmax <- sum(imps_within_dmax) / sum(grid$n[dists_within_indices]) # normalize by number of destinations
+#     
+#     accessibility[i] <- avg_within_dmax
+#     
+#     accessibility[i] <- ifelse(is.na(accessibility[i]), 0, accessibility[i])
+#   }
+#   return(accessibility)
+# }
+# 
+# # beta_calc <- -(log(0.2) / 5000)
+# beta_value <- 0.00018 # beta value for all types of destinations
+# grid$ba_tot <- calcAccessibility_grid(grid, 5000, beta_value, "weight")
+```
+
+```{r}
+# nearest_nodes_grid <- find_nearest_node(grid, nodes_tibble)
+# cost_mat <- st_network_cost(network, from = nearest_nodes_grid, to = nearest_nodes_grid, weights = "weight") # get cost matrix of shortest paths
+# cost_mat <- as.data.frame(cost_mat)
+# cost_mat <- drop_units(cost_mat)
+# # diag(cost_mat) = NA # replace values for same starting and end point of trip with NA
+# colnames(cost_mat) <- c(1:ncol(cost_mat))
+# 
+# 
+# accessibility <- rep(NA, nrow(cost_mat))
+# for(i in 1:nrow(cost_mat)){
+#   dists <- cost_mat %>% dplyr::pull(i)
+#   dists_within_dmax <- dists[dists <= 5000] # select those distances below dmax
+#   dists_within_indices <- which(dists <= 5000) # get indices of points within dmax
+#   imps_within_dmax <- grid$n[dists_within_indices] * exp(-beta_value * dists_within_dmax) # exponential distance weighting function, using number of destinations as weight
+#   avg_within_dmax <- sum(imps_within_dmax) / sum(grid$n[dists_within_indices]) # take mean value
+#   
+#   accessibility[i] <- avg_within_dmax
+#   
+#   accessibility[i] <- ifelse(is.na(accessibility[i]), 0, accessibility[i])
+# }
+# summary(accessibility)
+# 
+# # dists <- cost_mat %>% dplyr::pull(1)
+# # dists_within_dmax <- dists[dists <= 5000]
+# # dists_within_indices <- which(dists <= 5000)
+# # grid$n[dists_within_indices] * exp(-beta_value * dists_within_dmax)
+# # 
+# # grid$ba_tot <- accessibility
+```
+
+```{r}
+# # Plot quartiles using grid
+# grid <- grid %>%
+#   mutate(quantile=ntile(ba_tot, 4))
+# 
+# ggplot() + 
+#     geom_sf(data = grid, aes(col=as.factor(quantile)), size = 0.5) +
+#     scale_color_manual(values=c("#132B43", "#28547A", "#3E81B7", "#56B1F7")) +
+#     # geom_sf(data = desttype, aes(fill = typename), col = "red", shape = 17, size = 2.5) +
+#     coord_sf(datum = 2056) +
+#     theme_void() +
+#     labs(title = paste("Accessibility to all destinations using grid"), colour="Accessibility quartile", fill="") +
+#     guides(colour = guide_legend(override.aes = list(size=4)))
+```
+
+```{r}
+# # Plot
+# ggplot() + 
+#     geom_sf(data = grid, aes(col=ba_tot), size = 0.5) +
+#     scale_color_viridis_b() +
+#     # geom_sf(data = train_stat, aes(fill = "Badis"), col = "red", shape = 17, size = 2.5) +
+#     coord_sf(datum = 2056) +
+#     theme_void() +
+#     labs(title = paste("Accessibility to all destinations using grid"), colour="Accessibility", fill="")
+```
+
+
+
+
+

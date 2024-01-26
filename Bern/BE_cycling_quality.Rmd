@@ -1,0 +1,1268 @@
+---
+title: "Cycling quality"
+author: "Nicola Maiani"
+date: '2023-06-23'
+output: html_document
+---
+
+# Model cycling quality
+## Preliminaries
+```{r, message = FALSE, warning = FALSE}
+test_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE))
+    {
+      install.packages(x, dep = TRUE)
+        if(!require(x, character.only = TRUE)) stop("Package not found")
+    }
+}
+
+test_pkg("sf")
+test_pkg("ggplot2")
+test_pkg("sfnetworks")
+test_pkg("tidyverse")
+test_pkg("tidygraph")
+test_pkg("tmap")
+test_pkg("igraph")
+test_pkg("units")
+test_pkg("raster")
+test_pkg("sp")
+test_pkg("plyr")
+test_pkg("dplyr")
+test_pkg("lidR")
+test_pkg("reshape")
+
+dataFolder <- here::here("data")
+RFolder <- here::here()
+figureFolder <- here::here("figs")
+```
+
+## Load data
+```{r, warning = FALSE}
+# Load preprocessed network
+# network <- readRDS(here::here("data", "bern/network_be.rds"))
+edges <- st_read(file.path(dataFolder, "bern/edges_be.shp"))
+network <- as_sfnetwork(edges, directed = FALSE)
+network <- network %E>% 
+  dplyr::mutate(id = row_number())
+
+# Accident data: Accidents with personal injury
+accidents_all <- read.csv(file.path(dataFolder, "accidents/accidents.csv"), sep = ",")
+
+accidents_all <- accidents_all %>% dplyr::select("AccidentUID", "AccidentType", "AccidentType_en", "AccidentSeverityCategory", "AccidentSeverityCategory_en", "AccidentInvolvingPedestrian", "AccidentInvolvingBicycle", "AccidentInvolvingMotorcycle", "RoadType", "RoadType_en", "AccidentLocation_CHLV95_E", "AccidentLocation_CHLV95_N", "AccidentYear")
+
+accidents_bike <- accidents_all %>% 
+  filter(AccidentInvolvingBicycle == "true")
+
+accidents_bike <- st_as_sf(x = accidents_bike, coords = c("AccidentLocation_CHLV95_E", "AccidentLocation_CHLV95_N"), crs = 2056)
+
+# City borders
+communities <- st_read(file.path(dataFolder, "gemeindegrenzen/swissBOUNDARIES3D_1_4_TLM_HOHEITSGEBIET.shp")) # load Swiss communities
+border <- communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Bern") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)
+
+# DEM: Load DEM with a resolution of 2 meters
+links_dem <- read.csv(file.path(dataFolder, "links_dem_be.csv"), sep = ",", header = FALSE)
+dem <- raster(paste0('/vsicurl/',links_dem$V1[1]))
+crs(dem) <- "+init=epsg:2056" # define CRS of DEM
+
+for(i in 2:nrow(links_dem)){
+  dem_part <- raster(paste0('/vsicurl/',links_dem$V1[i]))
+  crs(dem_part) <- "+init=epsg:2056" # define CRS of DEM
+  dem <- raster::merge(dem, dem_part, overlap = TRUE, tolerance = 0.1)
+}
+
+# Save DEM with 2m resolution
+saveRDS(dem, file = here::here("data", "dem2m_be.rds"))
+
+dem <- readRDS(here::here("data", "dem2m_be.rds"))
+
+# Load swissSURFACE dataset
+links_surface <- read.csv(file.path(dataFolder, "winterthur/swisssurface_wt.csv"), sep = ",", header = FALSE)
+
+temp <- tempfile()
+download.file(links_surface$V1[1], temp)
+filename <- unzip(temp, list = TRUE)[1, 1]
+unzip(temp)
+
+filenames <- list.files(file.path(dataFolder, "surface_wt"))
+swisssurface <- readLAS(file.path(dataFolder, paste0("surface_wt/", filenames[1])), select = c("xyzc"), filter = "-keep_class 17")@data # only take points from bridges
+unlink(temp)
+
+swisssurface <- swisssurface[sample(nrow(swisssurface), nrow(swisssurface) / 3), ] # sample 33% of points
+swisssurface <- st_as_sf(swisssurface, coords = c("X", "Y"))
+
+for(i in 2:length(filenames)){
+  temp <- tempfile()
+  download.file(links_surface$V1[i], temp)
+  filename <- unzip(temp, list = TRUE)[1, 1]
+  unzip(temp)
+  part_surf <- readLAS(file.path(dataFolder, paste0("surface_wt/", filenames[i])), select = c("xyzc"), filter = "-keep_class 17")@data # only take points from bridges
+  unlink(temp)
+
+  part_surf <- part_surf[sample(nrow(part_surf), nrow(part_surf) / 3), ] # sample 33% of points
+  part_surf <- st_as_sf(part_surf, coords = c("X", "Y"))
+
+  swisssurface <- bind_rows(swisssurface, part_surf)
+}
+
+swisssurface <- st_as_sf(swisssurface, coords = c("X", "Y"), crs = 2056)
+
+# Save surface data
+saveRDS(swisssurface, file = here::here("data", "winterthur/surface_wt.rds"))
+
+swisssurface <- readRDS(here::here("data", "winterthur/surface_wt.rds"))
+st_crs(swisssurface) = 2056
+# surface_ground <- swisssurface %>% filter(Classification == 2) # ground points
+surface_bridges <- swisssurface %>% filter(Classification == 17) # points of bridges and viaducts
+
+# Green areas OSM
+green_areas <- st_as_sf(st_read(file.path(dataFolder, "green_areas/green_areas.shp")))
+green_areas <- st_transform(green_areas, crs = 2056)
+
+# Aquatic areas OSM
+aquatic_areas <- st_as_sf(st_read(file.path(dataFolder, "aquatic_areas/aquatic_areas.shp")))
+aquatic_areas <- st_transform(aquatic_areas, crs = 2056)
+
+# Trees swissTLM3D
+trees <- st_as_sf(st_read(file.path(dataFolder, "trees/swissTLM3D_TLM_EINZELBAUM_GEBUESCH_WEST.shp")))
+trees <- st_zm(trees, drop = TRUE, what = "ZM") # drop Z dimension
+trees <- st_transform(trees, crs = 2056)
+```
+
+
+## Model accidents
+```{r}
+# Filter accidents to case study area and select accidents of the last four years
+bike_acc <- st_filter(accidents_bike, border, .predicate = st_within)
+bike_acc <- bike_acc %>% filter(AccidentYear %in% c(2019,2020,2021,2022))
+```
+
+```{r}
+# Only keep accidents, which are at most 10m away from an edge of the bike network: Of the 533 accidents 527 are kept
+net_buffer <- st_buffer(network %>% activate(edges) %>% st_as_sf(), dist = 10)
+bike_acc_inside <- st_filter(bike_acc, net_buffer) # accidents inside buffer
+
+bike_acc_outside <- bike_acc %>%
+  filter(!(AccidentUID %in% bike_acc_inside$AccidentUID)) # accidents which get dropped
+```
+
+```{r}
+# Map accidents inside buffer
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(bike_acc_inside) + tm_dots(col = "red")
+```
+
+```{r}
+# Map accidents outside buffer
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(bike_acc_outside) + tm_dots(col = "red")
+```
+
+Assessing the included and excluded accidents visually, a threshold of 10m has been found to fit well. Some accidents are excluded, since they lie on a way not included in the network, which makes sense. Some are excluded due to border effects. 10m fit well, because accidents happening on the side of a wide road, i.e. on a cycling lane, are still included if the street axis lies in the middle. And furthermore, accidents happening on a regular street are excluded if there is separate cycling infrastructure and regular street is excluded in network, since it has the tag use_sidepath. At complex locations with over- and underpassing streets like Escher-Wyss or Hardbrücke 1-3 points probably get assigned to wrong segment, but overall the matching works also well for these locations, assuming that the location of the accident is correct. 
+
+```{r}
+# # Severity of accidents: as1=fatalities, as2=severe injuries, as3=light injuries
+# # Create column for accident score based on severity and year of accident?
+# bike_acc <- bike_acc_inside %>%
+#   mutate(
+#     score_type = ifelse(AccidentSeverityCategory == "as1", 3,
+#                    ifelse(AccidentSeverityCategory == "as2", 2, 1))
+#   )
+```
+
+```{r}
+# Count number of accidents per edge, assigning accidents to nearest edge
+bike_acc <- bike_acc_inside
+bike_acc <- bike_acc %>% 
+  mutate(nearest_edge = st_nearest_feature(bike_acc, network %E>% st_as_sf())
+  )
+
+bike_acc_count <- bike_acc %>%
+  dplyr::group_by(nearest_edge) %>%
+  dplyr::count() %>%
+  st_drop_geometry()
+
+num_acc_per_edge <- left_join(network %E>% as_tibble(spatial = FALSE), bike_acc_count, by = c("id" = "nearest_edge")) %>%
+  dplyr::select(id, n)
+
+num_acc_per_edge$n[is.na(num_acc_per_edge$n)] <- 0 # replace NA values with 0
+
+network <- network %E>%
+  left_join(num_acc_per_edge, by = "id")
+network <- network %E>%
+  dplyr::rename("num_accidents" = "n")
+
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(num_accidents) %>% summary()
+```
+
+```{r}
+# Map accidents and number of accidents per edge
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines(col = "num_accidents") +
+tm_shape(bike_acc) + tm_dots(col = "red")
+```
+
+```{r}
+# Distribution of edges that have at least one accident
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(num_accidents) %>% filter(num_accidents > 0) %>% summary()
+```
+
+```{r}
+# Relationship between number of accidents and length of segment
+plot(network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(weight), network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(num_accidents), xlab = "Length", ylab = "Number of accidents", main = "Segment length vs. number of accidents")
+
+qqnorm(network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(weight))
+qqnorm(network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(num_accidents))
+
+# Variables are not normally distributed, therefore use Spearman correlation
+cor(network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(weight), network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(num_accidents), method = "spearman")
+cor.test(network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(num_accidents), network %E>% as_tibble(spatial = FALSE) %>% dplyr::pull(weight), method = "spearman", alternative = "greater", exact = TRUE)
+
+# # Use number of accidents relative to segment length, instead of absolute number
+# network <- network %E>% 
+#   dplyr::mutate(num_acc_rel = num_accidents / drop_units(weight)
+#   )
+# network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(num_acc_rel) %>% summary()
+```
+
+The correlation between segment length and number of accidents is significant, but very weak (effect size). Let's therefore work with the absolute number of accidents. 
+
+```{r}
+# Define cost function for number of accidents
+network <- network %E>% 
+  dplyr::mutate(cost_accidents = ifelse(num_accidents == 0, 0,
+                                        ifelse(num_accidents == 1, 0.2,
+                                        ifelse(num_accidents > 1, 0.6, 0)))
+  )
+```
+
+```{r}
+# Save accident data
+edges_acc_df <- network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(id, num_accidents, cost_accidents)
+write_csv(edges_acc_df, file.path(dataFolder, "bern/edges_accidents.csv"))
+
+# Load accident data
+edges_accidents <- read.csv(file.path(dataFolder, "bern/edges_accidents.csv"), sep = ",")
+network <- network %E>%
+  left_join(edges_accidents, by = "id")
+```
+
+
+## Model slope
+### Using DEM
+```{r}
+# DEM with resolution of 2m
+# crs(dem) <- "+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs +type=crs"
+plot(dem)
+```
+
+```{r}
+# Distribution of segment lengths
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(weight) %>% summary()
+```
+
+```{r}
+# Number of segments with a length above 250 meters
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(weight) %>% drop_units() %>% filter(weight >= 250) %>% dplyr::summarise(Num_segments = n())
+```
+
+The segments in the network are rather short. It therefore seems reasonable and suited to use the slope between the lowest and highest point of a segment as the slope for the segment (average slope), since the gradient can be assumed to change not that much on such short segments. Calculate slope using approach/code by Wysling & Purves (2022) and https://rpubs.com/michaeldorman/395172.
+```{r}
+# Calculate slope using 2m DEM
+library(plyr)
+segments <- network %E>% st_as_sf() %>%
+  dplyr::mutate(ID = as.numeric(c(1:n())))
+segments_points <- st_cast(segments, "POINT") # get points of all segments
+segments_points$seq = ave(segments_points$ID, segments_points$ID, FUN = seq_along) # counts sequence for points per edge
+flag = ddply(
+  st_set_geometry(segments_points, NULL),
+  "ID",
+  summarize,
+  flag = seq == min(seq) | seq == max(seq)
+  )$flag # values TRUE or FALSE for each point: TRUE for point at start or end of a segment
+segments_points = segments_points[flag, ] # filter first and last (= TRUE / flags from all points)
+type_flag = ddply(
+  st_set_geometry(segments_points, NULL),
+  "ID",
+  summarize,
+  elevationtype = ifelse(seq == min(seq), "first", "last")
+)
+segments_points$elevationtype = type_flag$elevationtype
+
+first = segments_points[segments_points$elevationtype == "first", ]
+last = segments_points[segments_points$elevationtype == "last", ]
+
+# Extract data
+dat = data.frame(ID = first$ID, elev1 = NA, elev2 = NA, dist = first$weight, stringsAsFactors = FALSE)
+
+for(i in unique(dat$ID)) {
+  dat$elev1[i] = raster::extract(dem, first[i, ])
+  dat$elev2[i] = raster::extract(dem, last[i, ])
+}
+
+# Calculate angle
+dat$slope = (dat$elev1 - dat$elev2) / dat$dist # slope in %
+# # dat$slope = atan((dat$elev1 - dat$elev2) / dat$dist) # calculate angle in radians
+# # dat$slope = (dat$slope * 180) / (pi) # angle in degrees
+
+dat_slopes <- dat[ ,-c(2, 3, 4)]
+slopes <- dat_slopes
+
+# Add slope to edges of network
+network <- network %E>%
+  dplyr::mutate(
+    slope_dem = slopes[, 2]
+  )
+
+# Define slope categories following Broach et al. 
+network <- network %E>%
+  dplyr::mutate(slopecat_dem = ifelse(abs(slope_dem) == 0, "0-2", 
+                       ifelse(abs(slope_dem) > 0 & abs(slope_dem) < 0.02, "0-2", 
+                       ifelse(abs(slope_dem) >= 0.02 & abs(slope_dem) < 0.04, "2-4",
+                       ifelse(abs(slope_dem) >= 0.04 & abs(slope_dem) < 0.06, "4-6", 
+                       ifelse(abs(slope_dem) >= 0.06, "6+","unknown"))))))
+
+edges_dem <- network %E>% st_as_sf()
+
+st_write(edges_dem, dsn = here::here("data", "bern/edges_dem.shp"), delete_layer = TRUE)
+# detach("package:plyr", unload = TRUE) # unload plyr package for convenience
+```
+
+### Slope of bridges
+The Swisssurface3D dataset is not available yet for Bern, but will be soon. So, the slope of bridges has been determined manually.
+```{r}
+# Have a look at bridge and tunnel tags
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(bridge) %>% group_by(bridge) %>% count()
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(tunnel) %>% group_by(tunnel) %>% count()
+```
+
+```{r}
+# Look at bridges
+network <- network %E>% 
+  dplyr::mutate(id = as.numeric(c(1:n())))
+
+network <- network %N>% 
+  dplyr::mutate(id = as.numeric(c(1:n())))
+
+bridges <- network %E>%
+  filter(bridge == "yes" | bridge == "viaduct" | bridge == "covered") %N>% filter(!node_is_isolated())
+
+nodes_bridges <- bridges %N>%
+  as_tibble()
+nodes_bridges <- st_as_sf(nodes_bridges, sf_column_name = "geometry")
+nodes_bridges_idx <- nodes_bridges %>% pull(id)
+```
+
+```{r}
+# Also include edges, which have just one node as part of a bridge in bridges dataset
+bridges_full <- network %E>%
+  dplyr::filter(from %in% nodes_bridges_idx | to %in% nodes_bridges_idx) %N>% filter(!node_is_isolated())
+bridges <- bridges_full
+
+edges_slope <- bridges %E>% as_tibble() %>% st_as_sf()
+# st_write(edges_slope, dsn = here::here("data", "bern/bridges_slope.shp"), delete_layer = TRUE)
+```
+
+```{r}
+# Set/correct slopes of bridges manually
+network <- network %E>%
+  dplyr::mutate(
+    slope = slope_dem
+  )
+
+network <- network %E>%
+  dplyr::mutate(slope = ifelse(from == 8365 & to == 8367, 0, slope),
+                slope = ifelse(from == 8365 & to == 8366, 0, slope),
+                slope = ifelse(from == 450 & to == 451, 0, slope),
+                slope = ifelse(from == 451 & to == 7316, 0, slope),
+                slope = ifelse(from == 7314 & to == 7316, 0, slope),
+                slope = ifelse(from == 8363 & to == 8365, 0.006, slope),
+                slope = ifelse(from == 6386 & to == 6388, 0.025, slope),
+                slope = ifelse(from == 6389 & to == 6390, 0.03, slope),
+                slope = ifelse(from == 5668 & to == 6274, 0.002, slope),
+                slope = ifelse(from == 5667 & to == 5670, 0.002, slope),
+                slope = ifelse(from == 5669 & to == 6275, 0.002, slope),
+                slope = ifelse(from == 5673 & to == 6274, 0.006, slope),
+                slope = ifelse(from == 5670 & to == 5671, 0.006, slope),
+                slope = ifelse(from == 5677 & to == 6275, 0.013, slope),
+                slope = ifelse(from == 5665 & to == 5668, 0, slope),
+                slope = ifelse(from == 5665 & to == 5667, 0, slope),
+                slope = ifelse(from == 5665 & to == 5669, 0, slope),
+                slope = ifelse(from == 9798 & to == 9800, 0.058, slope),
+                slope = ifelse(from == 9800 & to == 9802, 0.005, slope),
+                slope = ifelse(from == 774 & to == 775, 0.084, slope),
+                slope = ifelse(from == 777 & to == 778, 0.05, slope),
+                slope = ifelse(from == 4096 & to == 4104, 0, slope),
+                slope = ifelse(from == 786 & to == 4096, 0, slope),
+                slope = ifelse(from == 4096 & to == 4108, 0, slope),
+                slope = ifelse(from == 784 & to == 4108, 0.03, slope),
+                slope = ifelse(from == 728 & to == 785, 0.017, slope),
+                slope = ifelse(from == 785 & to == 787, 0, slope),
+                slope = ifelse(from == 787 & to == 788, 0.03, slope),
+                slope = ifelse(from == 721 & to == 723, 0, slope),
+                slope = ifelse(from == 718 & to == 721, 0.03, slope),
+                slope = ifelse(from == 2857 & to == 11206, 0, slope),
+                slope = ifelse(from == 2287 & to == 2289, 0, slope),
+                slope = ifelse(from == 2278 & to == 2364, 0, slope),
+                slope = ifelse(from == 3008 & to == 3009, 0.03, slope),
+                slope = ifelse(from == 3011 & to == 3385, 0.03, slope),
+                slope = ifelse(from == 2991 & to == 3249, 0.025, slope),
+                slope = ifelse(from == 3249 & to == 3250, 0.025, slope),
+                slope = ifelse(from == 3277 & to == 3279, 0.039, slope),
+                slope = ifelse(from == 3279 & to == 3280, 0.039, slope),
+                slope = ifelse(from == 3277 & to == 3278, 0.039, slope),
+                slope = ifelse(from == 3128 & to == 3278, 0.039, slope),
+                slope = ifelse(from == 2053 & to == 2054, 0, slope),
+                slope = ifelse(from == 1888 & to == 2053, 0, slope),
+                slope = ifelse(from == 1468 & to == 1502, 0, slope),
+                slope = ifelse(from == 9823 & to == 10335, 0.025, slope),
+                slope = ifelse(from == 10333 & to == 10342, 0.025, slope),
+                slope = ifelse(from == 10342 & to == 10345, 0.025, slope),
+                slope = ifelse(from == 10335 & to == 10344, 0.025, slope),
+                slope = ifelse(from == 10344 & to == 10347, 0.025, slope),
+                slope = ifelse(from == 10334 & to == 10343, 0.025, slope),
+                slope = ifelse(from == 10343 & to == 10346, 0, slope),
+                slope = ifelse(from == 8007 & to == 8010, 0, slope),
+                slope = ifelse(from == 8010 & to == 8014, 0, slope),
+                slope = ifelse(from == 8007 & to == 8011, 0, slope),
+                slope = ifelse(from == 8011 & to == 8052, 0, slope),
+                slope = ifelse(from == 8007 & to == 8012, 0, slope),
+                slope = ifelse(from == 8012 & to == 9885, 0, slope),
+                slope = ifelse(from == 8008 & to == 9907, 0.03, slope),
+                slope = ifelse(from == 7999 & to == 9907, 0.03, slope),
+                slope = ifelse(from == 8006 & to == 8008, 0.03, slope),
+                slope = ifelse(from == 9765 & to == 9768, 0.03, slope),
+                slope = ifelse(from == 10288 & to == 10299, 0, slope),
+                slope = ifelse(from == 7415 & to == 7416, 0.02, slope),
+                slope = ifelse(from == 7412 & to == 7415, 0.02, slope),
+                slope = ifelse(from == 7416 & to == 7417, 0.02, slope),
+                slope = ifelse(from == 11005 & to == 11006, 0.02, slope),
+                slope = ifelse(from == 4512 & to == 4521, 0.03, slope),
+                slope = ifelse(from == 745 & to == 4521, 0.03, slope)
+                )
+```
+
+```{r}
+# Set slopes of tunnels to 0 
+network <- network %E>%
+  dplyr::mutate(slope = ifelse(tunnel == "building_passage" | tunnel == "covered" | tunnel == "yes" | tunnel == "passage" | tunnel == "culvert", 0, slope)
+                )
+
+# Set slopes of bridges with slope > 12% (unrealistic) to NA
+network <- network %E>%
+  dplyr::mutate(slope = ifelse(slope > 0.12 & (bridge == "yes" | bridge == "viaduct" | bridge == "covered"), NA, slope)
+                )
+```
+
+```{r}
+# Correction of slope by hand
+network <- network %E>%
+  dplyr::mutate(slope = ifelse(from == 7314 & to == 7316, 0, slope),
+                slope = ifelse(from == 6445 & to == 6687, 0.03, slope),
+                slope = ifelse(from == 6443 & to == 6444, 0.03, slope),
+                slope = ifelse(from == 3785 & to == 3793, 0.01, slope),
+                slope = ifelse(from == 7482 & to == 7483, 0.02, slope),
+                slope = ifelse(from == 7475 & to == 7476, 0.03, slope),
+                slope = ifelse(from == 7476 & to == 7480, 0.03, slope),
+                slope = ifelse(from == 7489 & to == 8072, 0, slope),
+                slope = ifelse(from == 8234 & to == 8236, 0, slope),
+                )
+
+# Correction of slopes >30% and length <20m
+network <- network %E>%
+  dplyr::mutate(slope = ifelse(abs(slope) > 0.30 & weight < 20, NA, slope))
+
+# Define slope categories following Broach et al. 
+network <- network %E>%
+  dplyr::mutate(slopecat = ifelse(abs(slope) == 0, "0-2", 
+                       ifelse(abs(slope) > 0 & abs(slope) < 0.02, "0-2", 
+                       ifelse(abs(slope) >= 0.02 & abs(slope) < 0.04, "2-4",
+                       ifelse(abs(slope) >= 0.04 & abs(slope) < 0.06, "4-6", 
+                       ifelse(abs(slope) >= 0.06, "6+","unknown"))))))
+```
+
+```{r}
+# Summary statistics of slopes
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(slopecat) %>% group_by(slopecat) %>% count()
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(slopecat, weight) %>% group_by(slopecat) %>% summarise(len = sum(weight))
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(slope) %>% summary()
+```
+
+```{r}
+# edges_net <- network %E>% st_as_sf()
+# 
+# # Map slope category
+# col.pal <- c("#ffcc66", "#ff6633", "#cc3300", "#660000")
+# 
+# ggplot() +
+#   geom_sf(data = edges_net, aes(col = slopecat), size = 0.2, show.legend = "line") +
+#   theme_void() + 
+#   labs(x = NULL,
+#        y = NULL,
+#        title = "",
+#        subtitle = "") +
+#   scale_color_manual(values= col.pal, name = "Slope category [%]")
+```
+
+```{r}
+# Define cost for slope following Broach et al. & Grigore et al. & Wysling et al. 
+network <- network %E>%
+  dplyr::mutate(cost_slope = ifelse(slopecat == "0-2" | is.na(slopecat), 0, 
+                       ifelse(slopecat == "2-4", 0.4, 
+                       ifelse(slopecat == "4-6", 1, 
+                              ifelse(slopecat == "6+", 1.5, NA)))))
+```
+
+```{r}
+# Save slope data
+edges_slope <- network %E>% as_tibble() %>% st_as_sf()
+edges_slope_df <- edges_slope %>% as_tibble() %>% dplyr::select(id, slope_dem, slopecat_dem, slope, slopecat, cost_slope)
+write_csv(edges_slope_df, file.path(dataFolder, "bern/edges_slope.csv"))
+st_write(edges_slope, dsn = here::here("data", "bern/edges_slope.shp"), delete_layer = TRUE)
+
+# Load slope data
+edges_slope <- read.csv(file.path(dataFolder, "bern/edges_slope.csv"), sep = ",")
+network <- network %E>%
+  left_join(edges_slope, by = "id")
+```
+
+
+## Model bicycle infrastructure
+### Speed limit
+```{r}
+network <- network %E>%
+  dplyr::mutate(
+    maxspeed = ifelse(maxspeed == -99, NA, maxspeed) # convert -99 to NA
+  )
+
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(maxspeed) %>% summary()
+net_no_speed <- network %E>% 
+  filter(is.na(maxspeed)) %N>% filter(!(node_is_isolated()))
+
+net_with_speed <- network %E>% 
+  filter(!(is.na(maxspeed))) %N>% filter(!(node_is_isolated()))
+
+len_with_speed <- net_with_speed %E>% data.frame() %>% dplyr::select(weight) %>% sum()
+len_no_speed <- net_no_speed %E>% data.frame() %>% dplyr::select(weight) %>% sum()
+
+cat("The share of the whole network where a maxspeed is given is:", len_with_speed/(len_with_speed + len_no_speed))
+```
+
+```{r}
+# Length of network segments with no maxspeed grouped by type of highway
+net_no_speed_df <- net_no_speed %E>% data.frame()
+aggregate(net_no_speed_df$weight, by = list(net_no_speed_df$highway), FUN = sum) %>% dplyr::arrange(desc(x))
+```
+
+```{r}
+# Mean maxspeed by different types of highway
+net_with_speed_df <- net_with_speed %E>% data.frame()
+aggregate(net_with_speed_df$maxspeed, by = list(net_with_speed_df$highway), FUN = mean) %>% dplyr::arrange(desc(x))
+```
+
+```{r}
+# Inspect maxspeed of different types of highways
+type_high <- network %E>%
+  filter(highway == "cycleway") %N>% filter(!(node_is_isolated()))
+
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") + tm_shape(st_as_sf(type_high %>% activate("edges")), "edges") + tm_lines(col = "maxspeed") + tm_shape(st_as_sf(type_high %>% activate("nodes")), "nodes") + tm_dots()
+```
+
+```{r}
+# # Map segments with speed limit in red, all others in black
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") + tm_shape(st_as_sf(net_no_speed %>% activate("edges")), "edges") + tm_lines() +
+#   tm_shape(st_as_sf(net_no_speed %>% activate("nodes")), "nodes") + tm_dots() +
+#   tm_shape(st_as_sf(net_with_speed %>% activate("edges")), "edges") + tm_lines(col = "red") 
+```
+
+The coverage of the maxspeed looks good. Most segments, which do not have any maxspeed provided are footways or paths, where a speed limit does not make sense anyways. There are some street segments with a missing maxspeed, let's try to impute values for them based on taginfo Switzerland of the correspoding highway type and the mean value of the segments which have a maxspeed provided. 
+
+```{r}
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") +
+#   tm_shape(st_as_sf(net_with_speed %>% activate("nodes")), "nodes") + tm_dots() +
+#   tm_shape(st_as_sf(net_with_speed %>% activate("edges")), "edges") + tm_lines(col = "maxspeed") 
+```
+
+- Service: Services have largest total length with NA values, but they are very short and minor connections to buildings => no imputation for NA values, treat them as paths
+- Track: Waldweg/Feldweg => no imputation for NA values
+- Path: Ways for non-motorized private trafic => no imputation for NA values
+- Footway: Ways for non-motorized private trafic and only footways included which explicitly allow bikes => no imputation for NA values
+- Cycleway: Ways explicitly for bikes separated from rest of traffic => no imputation for NA values
+- Residential: Segments not really coherent and short => impute mean value of 30 for NA values
+- Pedestrian: Not designated for motorized private traffic => no imputation for NA values
+- Unclassified: Mostly minor roads => impute mean value of 30 for NA values, even though it would be 50 with majority voting
+- Secondary: Overregional streets => impute mean value of 50 for NA values
+- Living street: All streets which have a value, have 20 => impute mean value of 20 for NA values
+- Tertiary: Streets which have a value mostly have 50, but there are also some with 30 => impute mean value of 50 for NA values
+- Tertiary link: Streets which have a value mostly have 50, but there are also some with 30 => impute mean value of 50 for NA values
+- Primary link: Streets which have a value mostly have 50 => impute mean value of 50 for NA values
+- Secondary link: Streets which have a value mostly have 50 => impute mean value of 50 for NA values
+- Primary: Streets which have a value mostly have 50 and they should be rather large streets => impute mean value of 50 for NA values
+- Unknown: Mostly segments not for motorized private traffic => no imputation for NA values
+```{r}
+# Define speed limit for different types of highways with NA values
+type_high20 <- c("living_street")
+type_high30 <- c("residential","unclassified")
+type_high50 <- c("secondary","tertiary","tertiary_link","primary_link","secondary_link","primary")
+
+# Impute maxspeed for some segments which have NA values
+network <- network %E>%
+  dplyr::mutate(maxspeed = ifelse(is.na(maxspeed) & (highway %in% type_high20), 20, 
+                       ifelse(is.na(maxspeed) & (highway %in% type_high30), 30, 
+                       ifelse(is.na(maxspeed) & (highway %in% type_high50), 50, maxspeed))))
+```
+
+### Bicycle infrastructure
+```{r}
+# Cyclestreets: There are no cyclestreets
+network %E>% st_as_sf()
+network_df <- network %E>% data.frame()
+aggregate(network_df$weight, by = list(network_df$cyclestree), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cyclestreet <- network %E>% 
+  filter(cyclestree == "unknown") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+# Cycleways
+aggregate(network_df$weight, by = list(network_df$cycleway), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cycleway <- network %E>% 
+  filter(cycleway == "separate") %N>% filter(!(node_is_isolated()))
+```
+
+- Opposite: One-way street without separate cycleway, but open for cyclists in opposite direction (both directions)
+- Lane: Radfahrstreifen
+- Opposite lane: Radfahrstreifen opposite to direction of driving of one-way street
+- Track: More separated from street than just by markings on ground
+- Crossing: Crossings as separate ways, but there are less than 10 in Zurich
+- |lane|: Visually: Lane between two lanes for MIV, but only 1 in ZH
+- Shared: Visually: Shared between bikes and pedestrians, but only 1 in ZH
+- Separate: Cycleway has been drawn separately, only 1 in ZH
+
+```{r}
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+  tm_shape(st_as_sf(type_cycleway %>% activate("nodes")), "nodes") + tm_dots() +
+  tm_shape(st_as_sf(type_cycleway %>% activate("edges")), "edges") + tm_lines() 
+```
+
+```{r}
+# Cycleways on both sides
+aggregate(network_df$weight, by = list(network_df$cycleway_b), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cycleway_b <- network %E>%
+  filter(cycleway_b == "lane") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+# Cycleway left
+aggregate(network_df$weight, by = list(network_df$cycleway_l), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cycleway_l <- network %E>%
+  filter(cycleway_l == "share_busway") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+  tm_shape(st_as_sf(type_cycleway_l %>% activate("nodes")), "nodes") + tm_dots() +
+  tm_shape(st_as_sf(type_cycleway_l %>% activate("edges")), "edges") + tm_lines() 
+```
+
+```{r}
+# Cycleway 1 = Cycleway left oneway
+aggregate(network_df$weight, by = list(network_df$cycleway_1), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cycleway_1 <- network %E>%
+  filter(cycleway_1 == "-1") %N>% filter(!(node_is_isolated()))
+```
+
+No description for cycleway left oneway on taginfo, but probably describes if cycleway on the left is oneway or not. Since the network is undirected, this variable can be ignored. 
+
+```{r}
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+  tm_shape(st_as_sf(type_cycleway_1 %>% activate("nodes")), "nodes") + tm_dots() +
+  tm_shape(st_as_sf(type_cycleway_1 %>% activate("edges")), "edges") + tm_lines() 
+```
+
+```{r}
+# Cycleway right
+aggregate(network_df$weight, by = list(network_df$cycleway_r), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cycleway_r <- network %E>%
+  filter(cycleway_r == "lane") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+# Cycleway 2 = Cycleway right oneway
+aggregate(network_df$weight, by = list(network_df$cycleway_2), FUN = sum) %>% dplyr::arrange(desc(x))
+type_cycleway_2 <- network %E>%
+  filter(cycleway_2 == "lane") %N>% filter(!(node_is_isolated()))
+```
+
+As cycleway left oneway, this variable can also be ignored.
+
+```{r}
+# Foot
+aggregate(network_df$weight, by = list(network_df$foot), FUN = sum) %>% dplyr::arrange(desc(x))
+type_foot <- network %E>%
+  filter(foot == "no") %N>% filter(!(node_is_isolated()))
+```
+
+Indicates if pedestrians are allowed or not. 
+
+```{r}
+# Bicycle
+aggregate(network_df$weight, by = list(network_df$bicycle), FUN = sum) %>% dplyr::arrange(desc(x))
+type_bicycle <- network %E>%
+  filter(bicycle == "designated") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+# Segregated
+aggregate(network_df$weight, by = list(network_df$segregated), FUN = sum) %>% dplyr::arrange(desc(x))
+type_seg <- network %E>%
+  filter(foot == "no") %N>% filter(!(node_is_isolated()))
+```
+
+Indicates if pedestrians and bikes are segregated or not.
+
+```{r}
+# Footway
+aggregate(network_df$weight, by = list(network_df$footway), FUN = sum) %>% dplyr::arrange(desc(x))
+type_footway <- network %E>%
+  filter(footway == "sidewalk") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+# Traffic calming measures: Table is Bodenwelle
+aggregate(network_df$weight, by = list(network_df$traffic_ca), FUN = sum) %>% dplyr::arrange(desc(x))
+type_traffic_ca <- network %E>%
+  filter(traffic_ca == "table") %N>% filter(!(node_is_isolated()))
+```
+
+Traffic calming variable can be ignored, since it describes calming measures for motorized private transport. 
+
+```{r}
+# Vehicles
+aggregate(network_df$weight, by = list(network_df$vehicle), FUN = sum) %>% dplyr::arrange(desc(x))
+type_vehicle <- network %E>%
+  filter(vehicle == "no") %N>% filter(!(node_is_isolated()))
+```
+
+```{r}
+# # Plot certain type of bicycle infrastructure
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") +
+#   tm_shape(st_as_sf(type_vehicle %>% activate("nodes")), "nodes") + tm_dots() +
+#   tm_shape(st_as_sf(type_vehicle %>% activate("edges")), "edges") + tm_lines() 
+```
+
+For most segments unknown, probably best to not consider this variable, but use instead type of highway to account for presence or absence of motorized private transport.
+
+```{r}
+# Types of highway
+highway_sum <- aggregate(network_df$weight, by = list(network_df$highway), FUN = sum) %>% dplyr::arrange(desc(x))
+highway_sum <- highway_sum %>% 
+  dplyr::mutate(relative_length = (x/sum(network_df$weight)) * 100) %>% drop_units()
+highway_sum
+```
+
+```{r}
+# Test correlation between maxspeed and number of accidents to justify choice for maxspeed variable
+net_df <- network %E>% as_tibble(spatial = FALSE)
+net_df_maxspeed <- net_df %>% filter(!(is.na(maxspeed)))
+sum(net_df_maxspeed$num_accidents) / sum(net_df$num_accidents) # percent of accidents still included after filtering out segments with no maxspeed
+
+cor(net_df_maxspeed$maxspeed, net_df_maxspeed$num_accidents, method = "spearman")
+cor.test(net_df_maxspeed$maxspeed, net_df_maxspeed$num_accidents, method = "spearman", alternative = "greater", exact = FALSE)
+```
+
+Maxspeed and number of accidents are significantly correlated (using Spearman's rank correlation), therefore it seems reasonable to use maxspeed to model suitability (approximating amount of traffic/safety). However, the effect size is quite small. 
+
+```{r}
+# # Check correlation between groups of maxspeed and number of accidents for justification of maxspeed groups
+# net_df_maxspeed <- net_df_maxspeed %>%
+#   dplyr::mutate(speedcat = ifelse(maxspeed < 30, "-30",
+#                                   ifelse(maxspeed == 30, "30",
+#                                          ifelse(maxspeed > 30 & maxspeed <= 50, "30-50",
+#                                                 ifelse(maxspeed > 50, "50-", NA)))))
+# 
+# aggregate(net_df_maxspeed$weight, by = list(net_df_maxspeed$speedcat), FUN = sum) %>% dplyr::arrange(desc(x)) # segment length of each maxspeed group
+# 
+# net_df_maxspeed <- net_df_maxspeed %>% dplyr::mutate(speedcat = factor(speedcat, levels = c("-30","30","30-50","50-")))
+# 
+# kruskal.test(num_accidents / drop_units(weight) ~ speedcat, data = net_df_maxspeed) # number of accidents normalized by length of segment
+# kruskal.test(num_accidents ~ speedcat, data = net_df_maxspeed) # raw number of accidents 
+# 
+# # Pairwise comparisons
+# pairwise.wilcox.test(net_df_maxspeed$num_accidents / drop_units(net_df_maxspeed$weight), net_df_maxspeed$speedcat, data = net_df_maxspeed, p.adjust.method = "BH")
+# pairwise.wilcox.test(net_df_maxspeed$num_accidents, net_df_maxspeed$speedcat, data = net_df_maxspeed, p.adjust.method = "BH")
+```
+
+For normalized and raw number of accidents, there seems to be a difference in number of accidents by the different maxspeed groups. The pairwise comparison of the maxspeed groups shows that there mostly are significant differences in number of accidents, except for the -30 and 50- category. But maybe this is due to the relatively small group size.
+
+### Preprocess services and paths
+It was tried to filter services and paths based on betweenness centrality to only include important ones. However, approach was dismissed. 
+#### Filter highway = service
+```{r}
+# network <- network %E>%
+#   dplyr::mutate(btw_centrality = centrality_edge_betweenness(weights = weight, directed = FALSE))
+# network_df <- network %E>% data.frame()
+# summary(network_df %>% filter(highway == "service") %>% pull(btw_centrality))
+```
+
+```{r}
+# # Use 3rd quartile as threshold
+# network <- network %E>%
+#   dplyr::filter(highway != "service" | (highway == "service" & (btw_centrality > 36003 | bicycle != "unknown" | !(is.na(maxspeed))))) %N>%
+#   dplyr::filter(!node_is_isolated())
+```
+
+```{r}
+# Insert 30 as speed limit for services such that services later receive BLOS of B (neutral quality)
+network <- network %E>%
+  dplyr::mutate(maxspeed = ifelse(highway == "service" & is.na(maxspeed), 30, maxspeed))
+```
+
+#### Filter highway = path
+```{r}
+# # Use 1st quartile as threshold
+# summary(network_df %>% filter(highway == "path") %>% pull(btw_centrality))
+# network <- network %E>%
+#   dplyr::filter(highway != "path" | (highway == "path" & (btw_centrality > 14088 | bicycle != "unknown" | !(is.na(maxspeed))))) %N>% 
+#   dplyr::filter(!node_is_isolated())
+# 
+# network_df <- network %E>% data.frame()
+# highway_sum <- aggregate(network_df$weight, by = list(network_df$highway), FUN = sum) %>% dplyr::arrange(desc(x))
+# highway_sum <- highway_sum %>% 
+#   dplyr::mutate(relative_length = (x/sum(network_df$weight)) * 100) %>% drop_units()
+# highway_sum
+# 
+# network <- network %E>% dplyr::select(-any_of(c("btw_centrality")))
+```
+
+```{r warning=FALSE}
+# # Main component
+# network <- upgrade_graph(network)
+# 
+# components <- components(network)$membership
+# main_comp_id <- which.max(components(network)$csize)
+# 
+# network <- network %N>%
+#   dplyr::mutate(
+#     component = components
+#   )
+# 
+# main_graph <- network %N>%
+#   dplyr::filter(component == main_comp_id)
+```
+
+```{r}
+# # Sub-components
+# sub_graphs <- network %N>%
+#   dplyr::filter(component != main_comp_id)
+# 
+# sub_graphs <- sub_graphs %N>% 
+#   dplyr::mutate(
+#     nindex = 1:nrow(sub_graphs %N>% as_tibble())
+#   )
+# 
+# sub_graphs_edges <- sub_graphs %E>% as_tibble() %>% as.data.frame()
+# sub_graphs_nodes <- sub_graphs %N>% as_tibble() %>% as.data.frame() %>% dplyr::select(nindex, component)
+# sub_graphs_edges <- sub_graphs_edges %>% left_join(sub_graphs_nodes, by = c("from"="nindex"))
+# sub_graphs_edges$weight <- as.numeric(sub_graphs_edges$weight)
+# sub_graphs_edges %>% group_by(component) %>% summarise(tot_length = sum(weight)) %>% summary()
+```
+
+If the disconnected sub-components are small in length and more or less randomly distributed in the study area, just work with extracted main connected component. 
+```{r}
+# # Plot disconnected sub-components
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") +
+# tm_shape(st_as_sf(sub_graphs %>% activate("edges")), "edges") +
+#   tm_lines() +
+# tm_shape(st_as_sf(sub_graphs %>% activate("nodes"), "nodes")) +
+#   tm_dots()
+```
+
+```{r}
+# Create lookup matrix for BLOS classes
+maxspeed_cat <- c("-30", "30", "30-50", "50-")
+infra_cat <- c("cycleway", "track", "shared_foot", "lane", "bus", "no", "pedestrian","footpath","service")
+lookup <- data.frame(matrix(c("A", "A", "A", "A", 
+                              "A", "B", "C", "D",
+                              "B", "B", "B", "B",
+                              "A", "B", "D", "E",
+                              "A", "B", "D", "E",
+                              "A", "B", "E", "F",
+                              "D", "D", "D", "D",
+                              "C", "C", "C", "C",
+                              "A", "B", "E", "F"), ncol = length(maxspeed_cat), nrow = length(infra_cat), byrow = TRUE))
+rownames(lookup) <- infra_cat
+colnames(lookup) <- maxspeed_cat
+
+lookup$infra <- rownames(lookup)
+rownames(lookup) <- NULL
+lookup_long <- lookup %>% pivot_longer(cols = -infra, names_to = c("speedcat"), values_to = "score")
+
+rownames(lookup) <- infra_cat
+lookup <- lookup[, -5]
+```
+
+```{r}
+# Assign one single type of infrastructure to each segment: Best infrastructure type per street is relevant
+network <- network %E>% 
+  dplyr::mutate(infra_cat = ifelse((highway == "cycleway" & (segregated == "yes" | (segregated == "unknown" & (foot %in% c("use_sidepath","no","unknown"))))) | ((highway == "track" | highway == "footway" | highway == "unknown") & (segregated == "yes" | (foot %in% c("use_sidepath","no")))) | cyclestree == "yes", "cycleway",
+                                     ifelse((highway == "cycleway" & (segregated == "no" | (segregated == "unknown" & !(foot %in% c("use_sidepath","no","unknown"))))) | ((highway == "track" | highway == "footway" | highway == "unknown" | highway == "steps") & (segregated != "yes" | !(foot %in% c("use_sidepath","no")))) | (highway == "pedestrian" & !(bicycle %in% c("no","unknown"))), "shared_foot",
+                                            ifelse(cycleway == "track" | cycleway_b == "track"| cycleway_l == "track" | cycleway_l == "opposite_track" | cycleway_r == "track" | cycleway_r == "opposite_track", "track",
+                                                   ifelse(cycleway == "lane" | cycleway == "opposite_lane" | cycleway_b == "lane" | cycleway_l == "lane" | cycleway_r == "lane" | cycleway == "crossing" | cycleway == "|lane|", "lane",
+                                                          ifelse(cycleway == "share_busway" | cycleway_l == "share_busway" | cycleway_r == "share_busway", "bus",
+                                                                 ifelse(highway == "service", "service",
+                                                                        ifelse(highway == "path" & (segregated == "yes" | (foot %in% c("use_sidepath","no"))), "cycleway",
+                                                                               ifelse(highway == "path" & (segregated == "no" | (!(foot %in% c("use_sidepath","no")) & foot != "unknown") | bicycle != "unknown"), "shared_foot",
+                                                                                                    ifelse(highway == "path" & (segregated == "unknown" | bicycle == "unknown"), "footpath", 
+                                                                                                           ifelse(highway == "pedestrian" & bicycle %in% c("no","unknown"), "pedestrian", "no"))))))))))
+  )
+
+# Speed category for each segment
+network <- network %>%
+  dplyr::mutate(speedcat = ifelse(maxspeed < 30, "-30",
+                                  ifelse(maxspeed == 30, "30",
+                                         ifelse(maxspeed > 30 & maxspeed <= 50, "30-50",
+                                                ifelse(maxspeed > 50, "50-", NA)))))
+
+# Length of segments for each speed category and infrastructure type
+network_df <- network %E>% data.frame()
+summary_infra <- aggregate(network_df$weight, by = list(network_df$infra_cat), FUN = sum) %>% dplyr::arrange(desc(x))
+summary_infra <- summary_infra %>% 
+  dplyr::mutate(relative_length = (x/sum(network_df$weight)) * 100) %>% drop_units()
+
+summary_speedcat <- aggregate(network_df$weight, by = list(network_df$speedcat), FUN = sum) %>% dplyr::arrange(desc(x))
+summary_speedcat <- summary_speedcat %>% 
+  dplyr::mutate(relative_length = (x/sum(network_df$weight)) * 100) %>% drop_units()
+
+summary_infra
+summary_speedcat
+```
+
+```{r}
+# Assign suitability score (BLOS) using lookup matrix
+network_df <- network_df %>% left_join(lookup_long, by=c("infra_cat" = "infra", "speedcat" = "speedcat"))
+
+infra_no_speed <- network_df %>% filter(is.na(speedcat))
+summary_no_speed <- aggregate(infra_no_speed$weight, by = list(infra_no_speed$infra_cat), FUN = sum) %>% dplyr::arrange(desc(x))
+summary_no_speed <- summary_no_speed %>% 
+  dplyr::mutate(relative_length = (x/sum(infra_no_speed$weight)) * 100) %>% drop_units()
+summary_no_speed
+
+network_df <- network_df %>%
+  dplyr::mutate(score = ifelse(is.na(speedcat), lookup[infra_cat, 2], score))
+
+network <- network %E>%
+  dplyr::mutate(suitability = network_df$score)
+```
+
+```{r}
+# Summary statistics of suitability scores
+network_df <- network %E>% data.frame()
+summary_quality <- aggregate(network_df$weight, by = list(network_df$suitability), FUN = sum) %>% dplyr::arrange(desc(x))
+summary_quality <- summary_quality %>% 
+  dplyr::mutate(relative_length = (x/sum(network_df$weight)) * 100) %>% drop_units()
+
+summary_quality
+```
+
+```{r}
+# Table with share of network segments, grouped by speedcat and infrastructure type
+sum_table <- data.frame(matrix(0, ncol = length(maxspeed_cat) + 1, nrow = length(infra_cat)))
+rownames(sum_table) <- infra_cat
+colnames(sum_table) <- c(maxspeed_cat, "rowsum")
+
+for (i in 1:nrow(lookup)){
+  infratype <- rownames(lookup)[i]
+  if (infratype %in% c("cycleway", "shared_foot", "pedestrian","footpath")){
+    filtered_df <- network_df %>% filter(infra_cat == infratype)
+    share <- (sum(filtered_df$weight) / sum(network_df$weight)) * 100
+    sum_table[i, 1] <- share
+    
+    next
+  }
+  
+  for (j in 1:ncol(lookup)){
+    speedtype <- colnames(lookup)[j]
+    
+    filtered_df <- network_df %>% filter(infra_cat == infratype & speedcat == speedtype)
+    share <- (sum(filtered_df$weight) / sum(network_df$weight)) * 100
+    sum_table[i, j] <- share
+  }
+}
+
+sum_table <- sum_table %>%
+  dplyr::mutate(rowsum = rowSums(sum_table))
+
+colsum <- as.numeric(colSums(sum_table))
+sum_table <- rbind(sum_table, colsum)
+rownames(sum_table)[10] <- "colsum"
+sum_table
+```
+
+```{r}
+# Define cost for BLOS
+network <- network %E>%
+  dplyr::mutate(cost_suitability = ifelse(suitability == "A", -0.2,
+                                     ifelse(suitability == "B", 0,
+                                            ifelse(suitability == "C", 0.1,
+                                                   ifelse(suitability == "D", 0.4,
+                                                          ifelse(suitability == "E", 0.6,
+                                                                 ifelse(suitability == "F", 0.8, 0))))))
+  )
+
+network %E>% st_as_sf()
+```
+
+### Association with accidents
+```{r}
+# net_df <- network %E>% as_tibble(spatial = FALSE)
+# net_df <- net_df %>% filter(suitability != "?") %>% dplyr::mutate(suitability = factor(suitability, levels = c("A","B","C","D","E")))
+# 
+# # Variables are not normally distributed, therefore use Spearman correlation
+# cor.test(xtfrm(net_df$suitability), net_df$num_accidents, method = "spearman", alternative = "greater", exact = FALSE)
+# cor.test(xtfrm(net_df$suitability), net_df$num_accidents / net_df$weight, method = "spearman", alternative = "greater", exact = FALSE)
+```
+
+There is a significant correlation between the number of accidents and the suitability score. 
+
+```{r}
+# plot(net_df$suitability, net_df$num_accidents, xlab = "Suitability", ylab = "Number of accidents")
+```
+
+```{r}
+# kruskal.test(num_accidents ~ suitability, data = net_df)
+# kruskal.test(num_accidents / drop_units(weight) ~ suitability, data = net_df) # number of accidents normalized by segment length
+```
+
+There is a significant difference in the number of accidents between any of the suitability score groups. 
+
+```{r}
+# # Pairwise comparisons
+# pairwise.wilcox.test(net_df$num_accidents, net_df$suitability, p.adjust.method = "BH", exact = FALSE)
+```
+
+For most pairwise comparisons the difference in number of accidents is significant, except for most comparisons involving suitability score D. However, this might be due to the small group size of group D (see segment lengths). 
+
+## Green and aquatic areas
+```{r}
+# Filter trees and green and aquatic areas to city boundary
+trees <- st_filter(trees, border, .predicate = st_within)
+green_areas <- st_intersection(green_areas, border)
+aquatic_areas <- st_intersection(aquatic_areas, border)
+
+# Merge green and aquatic areas to one sf object
+greenaquatic_areas <- rbind(green_areas, aquatic_areas)
+```
+
+```{r}
+trees %>% dplyr::group_by(OBJEKTART) %>% dplyr::count()
+trees <- trees %>% dplyr::filter(OBJEKTART == "Einzelbaum")
+```
+
+There are only trees in the trees dataset. Now choose a reasonable buffer size so that only trees direct to the street (and not behind buildings) are included. A distance of 10m has been chosen (as in Grigore et al.). 
+
+```{r}
+# Filter trees near to segments of the network: Of the 37236 trees, 18712 are still included
+net_buffer <- st_buffer(network %>% activate(edges) %>% st_as_sf(), dist = 10) # buffer size of 10m
+trees_relevant <- st_filter(trees, net_buffer) # trees inside buffer
+```
+
+### Alternative: Number of trees instead of area
+```{r}
+# # Count number of trees per edge, assigning trees to nearest edge
+# trees_relevant <- trees_relevant %>% 
+#   mutate(nearest_edge = st_nearest_feature(trees_relevant, network %E>% st_as_sf())
+#   )
+# 
+# trees_count <- trees_relevant %>%
+#   dplyr::group_by(nearest_edge) %>%
+#   dplyr::count()
+# 
+# summary(trees_count$n) 
+# 
+# trees_count_df <- st_drop_geometry(trees_count)
+# 
+# edges_network_sf <- network %E>% st_as_sf()
+# 
+# edges_network_sf <- edges_network_sf %>% 
+#   dplyr::mutate(id = row_number())
+# 
+# num_trees_per_edge <- left_join(edges_network_sf, trees_count_df, by = c("id" = "nearest_edge"))
+# 
+# num_trees_per_edge$n[is.na(num_trees_per_edge$n)] <- 0 # replace NA values with 0
+# sum(num_trees_per_edge$n)
+# 
+# summary(num_trees_per_edge$n)
+# 
+# num_trees <- num_trees_per_edge$n
+# 
+# network <- network %E>% dplyr::mutate(
+#     num_trees = num_trees
+#   )
+```
+
+```{r}
+# # Calculate index for trees: Number of trees per edge divided by segment length to account for differences in segment length
+# network <- network %E>% dplyr::mutate(
+#     trees_index = num_trees / weight
+#   )
+# network_df <- network %E>% data.frame()
+# summary(network_df$trees_index)
+```
+
+```{r}
+# # Map network segments with tree index
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") + tm_shape(st_as_sf(network %>% activate("edges")), "edges") + tm_lines(col = "trees_index") +
+#   tm_shape(st_as_sf(network %>% activate("nodes")), "nodes") + tm_dots()
+```
+
+### Green and aquatic areas
+4m as buffer size for trees has been chosen as default radius for trees in Zurich is 8m and also mean value is 8m. 
+```{r}
+# Buffer trees to model green area/shadow and merge them to greenaquatic areas dataset
+trees_relevant <- st_buffer(trees_relevant, dist = 4) # buffer trees with 4m
+trees_relevant <- trees_relevant %>% dplyr::select(geometry)
+greenaquatic_areas <- greenaquatic_areas %>% dplyr::select(geometry)
+greenaquatic_areas <- rbind(greenaquatic_areas, trees_relevant)
+greenaquatic_areas <- st_zm(greenaquatic_areas, drop = TRUE, what = "ZM") # drop Z dimension
+
+greenaquatic_areas <- greenaquatic_areas %>%
+  dplyr::group_by()  %>%
+  dplyr::summarise()
+
+st_write(greenaquatic_areas, dsn = here::here("data", "bern/greenaquatic_areas/greenaquatic_areas_be.shp"), delete_layer = TRUE)
+greenaquatic_areas <- st_as_sf(st_read(file.path(dataFolder, "bern/greenaquatic_areas/greenaquatic_areas_be.shp")))
+```
+
+```{r}
+# Conduct analysis on ssh instance
+# Share of green and aquatic areas within given buffer for each segment
+net_buffer <- st_buffer(network %>% activate(edges) %>% st_as_sf(), dist = 10, endCapStyle = "FLAT") # flat ends to avoid that greenaquatic areas are considered twice
+net_buffer <- net_buffer %>%
+  dplyr::mutate(area_buffer = st_area(net_buffer)) # area of buffer
+
+# Union all buffers to one geometry object
+net_union_buffer <- net_buffer %>%
+  dplyr::group_by()  %>%
+  dplyr::summarise()
+
+# Get intersecting areas and make data set greenaquatic valid
+greenaquatic_areas_within <- st_intersection(st_make_valid(greenaquatic_areas), net_union_buffer)
+intersection_areas <- st_intersection(greenaquatic_areas_within, net_buffer)
+intersection_areas$area <- st_area(intersection_areas) # greenaquatic areas within buffer
+summary(intersection_areas$area)
+
+# Calculate total greenaquatic area per segment and get share
+area_summary <- aggregate(intersection_areas$area, by=list(intersection_areas$id), FUN = sum)
+area_summary <- left_join(net_buffer, area_summary, by = c("id" = "Group.1"))
+area_summary <- area_summary$x %>% replace_na(0)
+network <- network %E>%
+  dplyr::mutate(greenaquatic_areas = area_summary) %>%
+  dplyr::mutate(area_buffer = net_buffer$area_buffer) %>%
+  dplyr::mutate(share_greenaquatic_areas = greenaquatic_areas / area_buffer)
+
+# Load data from ssh
+edges_greenaquatic <- read.csv(file.path(dataFolder, "bern/edges_greenaquatic.csv"), sep = ",")
+network <- network %E>%
+  left_join(edges_greenaquatic, by = "id")
+
+# Distribution of greenaquatic area share
+network %E>% st_as_sf()
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(share_greenaquatic_areas) %>% summary()
+```
+
+```{r}
+# Define benefit function as in Grigore et al. (2019)
+greenaquatic_benefit <- function(share, max_decrease){
+  benefit_greenaquatic = max_decrease - (max_decrease / (0.01 + exp(0.05*share*100)))
+  return(benefit_greenaquatic)
+}
+
+# Calculate benefit from greenaquatic areas for each segment, using maximum benefit of 0.1
+network <- network %E>%
+  # dplyr::mutate(share_greenaquatic_areas = drop_units(share_greenaquatic_areas)) %>%
+  dplyr::mutate(benefit_greenaquatic = greenaquatic_benefit(share_greenaquatic_areas, 0.1))
+
+# Distribution of benefits
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(benefit_greenaquatic) %>% summary()
+```
+
+```{r}
+plot(seq(0, 1, 0.001), greenaquatic_benefit(seq(0, 1, 0.001), 0.1), type = "l", col = "blue", xlab = "Share of green or water", ylab = "Benefit from green or water")
+```
+
+
+## Perceived distances
+```{r}
+network <- network %E>%
+  dplyr::mutate(total_cost = 1 + cost_accidents + cost_slope + cost_suitability - benefit_greenaquatic) %>%
+  dplyr::mutate(perceived_dist = total_cost * weight) %>%
+  dplyr::mutate(perceived_dist_suit = (1 + cost_suitability) * weight) %>%
+  dplyr::mutate(cost_no_acc = 1 + cost_slope + cost_suitability - benefit_greenaquatic) %>%
+  dplyr::mutate(perceived_dist_no_acc = cost_no_acc * weight)
+
+# Export
+edges_quality <- network %E>% st_as_sf()
+st_write(edges_quality, dsn = here::here("data", "bern/edges_quality.shp"), delete_layer = TRUE)
+saveRDS(network, file = here::here("data", "bern/network_quality.rds"))
+```
+
+```{r}
+# Distribution of total cost
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(total_cost) %>% summary()
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(cost_suitability) %>% summary()
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(cost_no_acc) %>% summary()
+
+# Difference between real and perceived distance
+network <- network %E>%
+  dplyr::mutate(diff_dist = perceived_dist - weight)
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(diff_dist) %>% summary()
+```
+
+## Violin plots share green and aquatic areas for all four case study areas
+```{r}
+network_be <- readRDS(here::here("data", "bern/network_quality.rds")) %E>%
+  mutate(city = "Bern") %E>% as_tibble()
+network_ls <- readRDS(here::here("data", "lausanne/network_quality.rds")) %E>%
+  mutate(city = "Lausanne") %E>% as_tibble()
+network_wt <- readRDS(here::here("data", "winterthur/network_quality.rds")) %E>%
+  mutate(city = "Winterthur") %E>% as_tibble()
+network_zh <- readRDS(here::here("data", "zurich/network_quality.rds")) %E>%
+  mutate(city = "Zurich") %E>% as_tibble()
+networks <- rbind(network_be, network_ls, network_wt, network_zh)
+networks <- networks %>% mutate(share_greenaquatic_areas = share_greenaquatic_areas*100)
+
+boxplot(networks$share_greenaquatic_areas ~ networks$city, ylab = "Share green and aquatic areas [%]", xlab = "")
+
+ggplot(networks, aes(x=city, y=share_greenaquatic_areas)) + geom_violin(trim = TRUE) +
+  stat_summary(fun.y=median, geom="point", size=2, color="red") +
+  stat_summary(fun.y=mean, geom = "point", size=2, color="blue") +
+  theme_minimal() + ylab("Share green and aquatic areas [%]") + xlab("City") +
+  theme()
+
+ggplot(networks, aes(x=city, y=share_greenaquatic_areas, color=city)) +
+  geom_boxplot(width=0.2, outlier.shape = NA) + theme_minimal() + ylab("Share green and aquatic areas [%]") + xlab("City") +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+
+

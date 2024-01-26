@@ -1,0 +1,251 @@
+---
+title: "Change mean distance ZH"
+author: "Nicola Maiani"
+date: '2023-08-04'
+output: html_document
+---
+
+# Model change in mean distance
+## Preliminaries
+```{r, message = FALSE, warning = FALSE}
+test_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE))
+    {
+      install.packages(x, dep = TRUE)
+        if(!require(x, character.only = TRUE)) stop("Package not found")
+    }
+}
+
+test_pkg("sf")
+test_pkg("ggplot2")
+test_pkg("sfnetworks")
+test_pkg("tidyverse")
+test_pkg("tidygraph")
+test_pkg("dplyr")
+test_pkg("tmap")
+test_pkg("igraph")
+test_pkg("units")
+test_pkg("sp")
+test_pkg("osmdata")
+test_pkg("foreign")
+
+dataFolder <- here::here("data")
+RFolder <- here::here()
+figureFolder <- here::here("figs")
+```
+
+## Load data
+```{r, warning = FALSE}
+# Load modeled network
+network <- readRDS(here::here("data", "lausanne/network_quality.rds"))
+network %E>% st_as_sf()
+
+# City borders
+communities <- st_read(file.path(dataFolder, "gemeindegrenzen/swissBOUNDARIES3D_1_4_TLM_HOHEITSGEBIET.shp")) # load Swiss communities
+border <- communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)
+
+# Take bounding box of community boundaries, since community consist of multiple parts
+border <- st_as_sfc(st_bbox(border)) %>% st_as_sf()
+border_wgs84 <- st_transform(border, crs = 4326) %>% st_bbox() # bounding box of city in WGS84 for OSM query
+
+# Public transport stations -> train stations
+public_trans <- read.csv(file.path(dataFolder, "oev_gueteklassen/OeV_Haltestellen_ARE.csv"), sep = ";", header = TRUE)
+public_trans <- st_as_sf(x = public_trans, coords = c("Y_Koord", "X_Koord"), crs = 2056)
+train_stat <- public_trans %>% filter(Bahnlinie_Anz > 0) # only keep train stations
+train_stat <- st_filter(train_stat, communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) # filter to only use train stations within border
+train_stat <- train_stat %>% # use category of station as weight
+  mutate(weight = ifelse(Hst_Kat == 1, 5,
+                         ifelse(Hst_Kat == 2, 4,
+                                ifelse(Hst_Kat == 3, 3,
+                                       ifelse(Hst_Kat == 4, 2,
+                                              ifelse(Hst_Kat == 5, 1, NA))))))
+
+# Schools
+nutzareal <- st_as_sf(st_read(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_NUTZUNGSAREAL.shp")))
+nutzareal <- st_zm(nutzareal, drop = TRUE, what = "ZM") %>% st_transform(crs = 2056) # drop Z dimension
+schools_info <- read.dbf(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_SCHULE.dbf"))
+schools_relation <- read.dbf(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_NUTZUNGSAREAL_SCHULE.dbf"))
+
+# Hobbies: Freizeitanlagenareal, Schwimmbadareal, Sportplatzareal, Zooareal
+hobbies <- st_as_sf(st_read(file.path(dataFolder, "TLM3D/TLM_AREALE/swissTLM3D_TLM_FREIZEITAREAL.shp")))
+hobbies <- st_zm(hobbies, drop = TRUE, what = "ZM") %>% st_transform(crs = 2056) # drop Z dimension
+hobbies$weight <- st_area(hobbies) # use area as weight
+hobbies <- hobbies %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% st_centroid()
+hobbies <- hobbies %>% filter(OBJEKTART %in% c("Freizeitanlagenareal", "Schwimmbadareal", "Sportplatzareal","Zooareal"))
+# hobbies <- hobbies %>% dplyr::select("geometry")
+
+# Hospitals
+hospitals <- nutzareal %>% filter(OBJEKTART == "Spitalareal")
+hospitals <- hospitals %>% # group by ARE NAME
+  dplyr::group_by(ARE_NAME_U) %>% 
+  dplyr::summarise(geometry = st_union(geometry), NAME = first(NAME))
+hospitals$weight <- st_area(hospitals) # area as weight
+hospitals <- hospitals %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% filter(drop_units(weight) > 4000) %>% st_centroid() # keep only hospitals with area > 5000 m2
+# hospitals <- hospitals %>% dplyr::select("geometry")
+
+# Public parks
+parks <- nutzareal %>% filter(OBJEKTART == "Oeffentliches Parkareal")
+parks$weight <- st_area(parks) # area as weight
+parks <- parks %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% filter(drop_units(weight) > 2000) %>% st_centroid() # keep only parks > 2500 m2
+# parks <- parks %>% dplyr::select("geometry")
+
+# Supermarkets and convenience stores: OSM
+pois <- st_as_sf(st_read(file.path(dataFolder, "osm_ch/gis_osm_pois_free_1.shp"))) %>% st_transform(crs = 2056) %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056))
+pois_area <- st_as_sf(st_read(file.path(dataFolder, "osm_ch/gis_osm_pois_a_free_1.shp"))) %>% st_transform(crs = 2056) %>% st_filter(communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) %>% st_centroid()
+con_p <- pois %>% filter(fclass == "convenience")
+con_a <- pois_area %>% filter(fclass == "convenience")
+convenience <- rbind(con_p, con_a)
+
+supermarkets_p <- pois %>% filter(fclass == "supermarket")
+supermarkets_a <- pois_area %>% filter(fclass == "supermarket")
+supermarkets <- rbind(supermarkets_p, supermarkets_a)
+
+stores <- rbind(supermarkets) # only consider grocery stores
+stores$weight <- 1 # weight 1 for every grocery store
+# stores <- stores %>% dplyr::select("geometry")
+
+# Population data
+statpop_ch <- read.csv(file.path(dataFolder, "STATPOP2022/STATPOP2022.csv"), sep = ";")
+statpop_ch <- statpop_ch %>% # take center of each hectare raster cell
+  mutate(E_KOORD = E_KOORD + 50,
+         N_KOORD = N_KOORD + 50)
+statpop_ch <- st_as_sf(x = statpop_ch, coords = c("E_KOORD", "N_KOORD"), crs = 2056)
+statpop_ch <- statpop_ch %>% dplyr::select(B22BTOT)
+statpop <- st_filter(statpop_ch, communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)) # populated hectare raster
+```
+
+```{r}
+schools <- nutzareal %>% filter(OBJEKTART == "Schul- und Hochschulareal")
+schools <- st_filter(schools, communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056))
+schools <- left_join(schools, schools_relation, by = c("UUID" = "NUTZ_U"))
+schools <- left_join(schools, schools_info, by = c("SCHULE_U" = "UUID"))
+schools <- schools %>% filter(ISCED_STUF %in% c("ISCED 2", "ISCED 3")) # filter to Sekundarstufe 1 und 2, auch ub und KW checken
+schools$weight <- st_area(schools)
+schools <- st_centroid(schools)
+# schools <- schools %>% dplyr::select("geometry")
+```
+
+```{r}
+# Put all destinations into one dataset
+weight_stores <- 0.7/2.15 # 0.253
+weight_schools <- 0.2/2.15 # 0.077
+weight_parks_hobbies <- 1.0/2.15 # 0.366
+weight_hospitals <- 0.05/2.15 # 0.035
+weight_train_stat <- 0.2/2.15 # 1 - weight_stores - weight_schools - weight_parks_hobbies - weight_hospitals
+
+train_stat <- train_stat %>%
+  mutate(weight = weight_train_stat) %>% select(weight)
+hobbies <- hobbies %>%
+  mutate(weight = weight_parks_hobbies/2) %>% select(weight)
+hospitals <- hospitals %>%
+  mutate(weight = weight_hospitals) %>% select(weight)
+parks <- parks %>%
+  mutate(weight = weight_parks_hobbies/2) %>% select(weight)
+schools <- schools %>%
+  mutate(weight = weight_schools) %>% select(weight)
+stores <- stores %>%
+  mutate(weight = weight_stores) %>% select(weight)
+
+destinations <- rbind(train_stat, hobbies, hospitals, parks, schools, stores )
+```
+
+```{r}
+# # Function to find nearest network node for a given point
+find_nearest_node <- function(points, nodes){
+  points %>%
+  mutate(
+    index_of_nearest_feature = st_nearest_feature(., nodes),
+    nearest_feature = st_geometry(nodes[index_of_nearest_feature,]),
+    nearest_point = purrr::pmap(
+      list(geometry, nearest_feature),
+      ~ st_nearest_points(.x, .y) %>% st_cast("POINT") %>% magrittr::extract2(2)
+    )
+  ) %>%
+  pull(nearest_point) %>%
+  st_sfc(crs = 2056)
+}
+```
+
+```{r}
+nodes_tibble <- network %N>%
+  as_tibble()
+nodes_tibble <- st_as_sf(nodes_tibble, sf_column_name = "geometry")
+
+nearest_nodes_pop <- find_nearest_node(statpop, nodes_tibble)
+
+summary_nearest_node <- function(points){ # point dataset as input
+  nearest_nodes_desttype <- find_nearest_node(points, nodes_tibble)
+  summary(st_distance(points, nearest_nodes_desttype, by_element = TRUE))
+}
+```
+
+## Calculate mean distance
+```{r}
+# Function to calculate mean distance to reachable destination
+calcMeandist_unweighted <- function(desttype, dmax, cost_string){
+  # inputs: desttype are destinations as points, dmax in meters, beta parameter of exponential function and cost variable as string
+  nearest_nodes_desttype <- find_nearest_node(desttype, nodes_tibble)
+  destinations_weights <- desttype$weight
+  cost_mat_real <- st_network_cost(network, from = nearest_nodes_pop, to = nearest_nodes_desttype, weights = "weight") # cost matrix using geographical distances
+  cost_mat <- st_network_cost(network, from = nearest_nodes_pop, to = nearest_nodes_desttype, weights = cost_string) # get cost matrix of shortest paths
+  cost_mat <- as.data.frame(cost_mat)
+  cost_mat <- drop_units(cost_mat)
+
+  meandist <- rep(NA, nrow(cost_mat))
+  for(i in 1:nrow(cost_mat)){
+    dists_within_dmax <- cost_mat[i, cost_mat_real[i, ] <= dmax] # select those distances below dmax
+    weights_within_dmax <- destinations_weights[cost_mat_real[i, ] <= dmax]
+    dists_within_dmax <- as.numeric(dists_within_dmax)
+    meandist[i] <- sum(weights_within_dmax * dists_within_dmax) / sum(weights_within_dmax) # take mean value
+
+    # meandist[i] <- ifelse(is.na(meandist[i]), 0, meandist[i])
+  }
+  return(meandist)
+}
+```
+
+#### Using real geographical distances
+```{r}
+# Using real geographical distances
+statpop[ , paste0("mdist_","tot_","real")] <- calcMeandist_unweighted(destinations, 4000, "weight") 
+```
+
+```{r}
+# Distribution of mean distance
+summary(statpop$mdist_tot_real)
+```
+
+#### Using perceived distances: BLOS only
+```{r}
+# Using perveived distances
+statpop[ , paste0("mdist_","tot_","per")] <- calcMeandist_unweighted(destinations, 4000, "perceived_dist_suit")
+```
+
+```{r}
+# Distribution of mean distance
+summary(statpop$mdist_tot_per)
+```
+
+```{r}
+statpop <- statpop %>%
+  dplyr::mutate(diff_mdist = mdist_tot_per - mdist_tot_real)
+summary(statpop$diff_mdist)
+hist(statpop$diff_mdist)
+```
+
+```{r}
+# Export statpop statistics
+coords <- st_coordinates(statpop) %>% data.frame()
+statpop$X <- coords$X
+statpop$Y <- coords$Y
+statpop_df <- statpop %>% st_drop_geometry()
+write_csv(statpop_df, file = file.path(dataFolder, "lausanne/statpop_ls_BA_change.csv"))
+```
+
+
+
+
+
+
+

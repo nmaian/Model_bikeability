@@ -1,0 +1,829 @@
+---
+title: "Preprocessing network Lausanne"
+author: "Nicola Maiani"
+date: "5/2/2023"
+output:
+  html_document:
+    df_print: paged
+    pandoc_args: [
+      "+RTS", "-K100000000000",
+      "-RTS"
+    ]
+---
+
+# Processing network
+## Preliminaries
+```{r, message = FALSE, warning = FALSE}
+test_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE))
+    {
+      install.packages(x, dep = TRUE)
+        if(!require(x, character.only = TRUE)) stop("Package not found")
+    }
+}
+
+test_pkg("sf")
+test_pkg("ggplot2")
+test_pkg("sfnetworks")
+test_pkg("tidyverse")
+test_pkg("tidygraph")
+test_pkg("dplyr")
+test_pkg("tmap")
+test_pkg("igraph")
+test_pkg("units")
+test_pkg("stplanr")
+
+dataFolder <- here::here("data")
+RFolder <- here::here()
+figureFolder <- here::here("figs")
+```
+
+## Load data
+```{r}
+# City borders
+communities <- st_read(file.path(dataFolder, "gemeindegrenzen/swissBOUNDARIES3D_1_4_TLM_HOHEITSGEBIET.shp")) # load Swiss communities
+border <- communities %>% filter(OBJEKTART == "Gemeindegebiet" & NAME == "Lausanne") %>% st_zm(drop = TRUE, what = "ZM") %>% st_transform(crs = 2056)
+
+# Population data
+statpop_ch <- read.csv(file.path(dataFolder, "STATPOP2021/STATPOP2021.csv"), sep = ";")
+statpop_ch <- st_as_sf(x = statpop_ch, coords = c("E_KOORD", "N_KOORD"), crs = 2056)
+statpop_ch <- statpop_ch %>% select(B21BTOT)
+statpop <- st_filter(statpop_ch, border)
+
+# City borders: Take bounding box of community boundaries, since community consist of multiple parts
+border <- st_as_sfc(st_bbox(border)) %>% st_as_sf()
+
+# Network
+network <- st_read(file.path(dataFolder, "network_ch/network_ch.shp")) # load Swiss OSM network
+network <- st_transform(network, 2056)
+network <- st_filter(network, border, .pred = st_intersects) # filter network to city borders
+```
+
+## Frequency of attribute values of street segments
+```{r}
+network %>% group_by(highway) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(route) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(junction) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(motorroad) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(access_con) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(barrier) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(bicycle) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(bicycle_co) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(bicycle_ro) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(bridge) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(cyclestree) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(cycleway_b) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(cycleway_l) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(cycleway_r) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(cycleway_1) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(cycleway_2) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(oneway_bic) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+network %>% group_by(ramp_bicyc) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+# Define function to summarize network topology
+summary_net <- function(net){
+  # net <- net %E>%
+  #   mutate(
+  #     weight = unclass(edge_length()))
+  # 
+  # net <- net %E>%
+  # mutate(
+  #   weight = ifelse(weight == 0, 0.01, weight)
+  # )
+  # 
+  # net <- net %N>% mutate(
+  #   degree = centrality_degree(weights = NULL),
+  #   closeness = centrality_closeness(weights = weight),
+  #   betweenness = centrality_betweenness(directed = FALSE, weights = weight)
+  # )
+  # 
+  # dual_morph <- net %>%
+  #   morph(to_linegraph)
+  # dual_net <- dual_morph$line_graph
+  # 
+  # dual_net <- dual_net %N>% mutate(
+  #   degree = centrality_degree(weights = NULL),
+  #   closeness = centrality_closeness(weights = NULL),
+  #   betweenness = centrality_betweenness(weights = NULL)
+  # )
+  
+  cat(paste("Number of nodes:", nrow(net %>% activate(nodes) %>% st_as_sf())), sep = "\n")
+  cat(paste("Number of edges:", nrow(net %>% activate(edges) %>% st_as_sf())), sep = "\n")
+  cat(paste("Number of components:", count_components(net, mode = "weak")), sep = "\n")
+  cat(paste("Number of under- or overpassing edges:", nrow(net %>% activate(edges) %>% filter(edge_crosses(.E())) %>% st_as_sf())), sep = "\n")
+  cat(paste("Number of multiple edges:", sum(which_multiple(net))), sep = "\n")
+  cat(paste("Number of loop edges:", sum(which_loop(net))), sep = "\n")
+  
+  # cat(paste("Node centralities:"), sep = "\n")
+  # print(net %N>% data.frame() %>% select(degree, closeness, betweenness) %>% summary())
+  # 
+  # cat(paste("Edge centralities:"), sep = "\n")
+  # print(dual_net %N>% data.frame() %>% select(degree, closeness, betweenness) %>% summary())
+}
+```
+
+## Create sfnetwork
+```{r}
+# Create undirected sfnetwork
+network <- as_sfnetwork(network, directed = FALSE)
+
+# Make edges spatially explicit
+network <- tidygraph::convert(
+  network,
+  to_spatial_explicit,
+  .clean = TRUE
+)
+```
+
+```{r}
+# Subdivide edges for topological correctness
+full_network <- convert(network, to_spatial_subdivision)
+# summary_net(full_network)
+```
+
+### Centralities of full/unfiltered network
+```{r}
+# Use edge length as weight and calculate centralities
+full_network <- full_network %E>%
+  mutate(
+    weight = edge_length()
+  )
+
+full_network <- full_network %N>% mutate(
+    degree = centrality_degree(weights = NULL),
+    closeness = centrality_closeness(weights = weight),
+    betweenness = centrality_betweenness(weights = weight, directed = FALSE)
+  )
+
+dual_morph <- full_network %>%
+  morph(to_linegraph)
+dual_net <- dual_morph$line_graph
+
+dual_net <- dual_net %N>% mutate(
+  degree = centrality_degree(weights = NULL),
+  closeness = centrality_closeness(weights = NULL),
+  betweenness = centrality_betweenness(weights = NULL)
+  )
+
+dual_net_df <- dual_net %N>% data.frame()
+
+full_network <- full_network %E>%
+  mutate(
+    degree_edge = dual_net_df$degree,
+    closeness_edge = dual_net_df$closeness,
+    betweenness_edge = dual_net_df$betweenness
+  )
+```
+
+```{r}
+# Save full network
+if (!file.exists(here::here("data", "full_network.rds"))) {
+saveRDS(full_network, file = here::here("data", "full_network.rds"))
+}
+```
+
+```{r}
+# Load full network with centralities
+full_network <- readRDS(here::here("data", "full_network_zh.rds")) # needs to be converted to sfnetwork!
+```
+
+### Filter with respect to attributes
+The filtering has been done with taginfo Switzerland and visually assessing values (if it makes sense or not). Use full network as first input!
+```{r}
+relevant_highway <- c("cycleway","living_street","path","primary","primary_link","pedestrian","residential","road","secondary","secondary_link","service","tertiary","tertiary_link","track","unclassified","yes","mini_roundabout", "crossing")
+```
+
+```{r}
+# Filter with respect to access and barriers
+network <- full_network %E>% # use full network here!
+  filter(is.na(access) | access %in% c("yes","customers","destination","permissive","unknown","public","residents","24/7","residential") | bicycle %in% c("yes","designated","permissive","private","destination","unknown")) %N>% filter(!node_is_isolated())
+  
+network <- network %E>%
+  filter(is.na(barrier)) %N>% filter(!node_is_isolated())
+
+# summary_net(network)
+```
+
+```{r}
+# Filter with respect to highways, also include other types of highways if bicycle explicitly allowed
+network <- network %E>%
+  filter(highway %in% relevant_highway | bicycle %in% c("yes","designated","permissive","private","destination","unknown") | footway %in% c("crossing")) %N>% filter(!node_is_isolated())
+
+network <- network %E>%
+  filter(!(highway %in% c("construction"))) %N>% filter(!node_is_isolated())
+
+network <- network %E>%
+  filter(is.na(motorroad)) %N>% filter(!node_is_isolated())
+
+# summary_net(network)
+```
+
+```{r}
+network <- network %E>%
+  filter(is.na(ramp_bicyc) | ramp_bicyc == "yes") %N>% filter(!node_is_isolated())
+
+# summary_net(network)
+```
+
+```{r}
+network <- network %E>%
+  filter(is.na(route) | route == "bicycle") %N>% filter(!node_is_isolated())
+
+# summary_net(network)
+```
+
+```{r}
+network <- network %E>%
+  filter(!(vehicle %in% c("agricultural","forestry","no","permit","delivery","agricultural;forestry")) | is.na(vehicle) | bicycle %in% c("yes","designated","permissive","private","destination","unknown")) %N>% filter(!node_is_isolated())
+
+# summary_net(network)
+```
+
+```{r}
+network <- network %E>%
+  filter(!(bicycle %in% c("dismount","mtb","no","use_sidepath"))) %N>% filter(!node_is_isolated())
+# summary_net(network)
+```
+
+```{r}
+network <- network %E>%
+  filter(!(smoothness %in% c("very_bad","impassable","horrible","very_horrible"))) %N>% filter(!node_is_isolated())
+```
+
+### Join important footways to network
+It has been tried to join footways important for the connectivity back to the network. However, approach was dismissed, since results were not satisfying and
+footways in OSM should be exclusively for pedestrians. 
+```{r}
+# # Select important footways
+# footways <- full_network %E>% filter(highway == "footway") %E>% filter(footway != "sidewalk" | is.na(footway)) %E>% 
+#   filter(is.na(access) | access %in% c("yes","customers","destination","permissive","unknown")) %E>%
+#   filter(!(vehicle %in% c("agricultural","forestry","no","permit"))) %E>%
+#   filter(!(bicycle %in% c("yes","designated","permissive","private","destination")) | is.na(bicycle)) %N>% 
+#   filter(!node_is_isolated()) # get footways, which aren't sidewalks
+# 
+# footways_df <- footways %E>% st_as_sf() %>% data.frame()
+# summary(footways_df$betweenness_edge)
+# 
+# footways_important <- footways %E>% filter(betweenness_edge > median(footways_df$betweenness_edge)) %N>% 
+# #  filter(drop_units(weight) < 150) %N>% 
+#   filter(!node_is_isolated())
+# 
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") +
+# tm_shape(footways_important %E>% st_as_sf(), "footways") +
+#   tm_lines() + tm_shape(st_as_sf(footways_important %>% activate("nodes"), "nodes")) + tm_dots()
+```
+
+```{r}
+# # Join them to network
+# network <- st_network_join(network, footways_important)
+```
+
+```{r}
+# # Use edge length as weight and calculate centralities on filtered network
+network <- network %E>%
+  mutate(
+    weight = edge_length()
+  )
+# 
+# network <- network %N>% mutate(
+#     degree = centrality_degree(weights = NULL),
+#     closeness = centrality_closeness(weights = weight),
+#     betweenness = centrality_betweenness(weights = weight, directed = FALSE)
+#   )
+# 
+# dual_morph <- network %>% 
+#   morph(to_linegraph)
+# dual_net <- dual_morph$line_graph
+#   
+# dual_net <- dual_net %N>% mutate(
+#   degree = centrality_degree(weights = NULL),
+#   closeness = centrality_closeness(weights = NULL),
+#   betweenness = centrality_betweenness(weights = NULL)
+#   )
+```
+
+```{r}
+# # Plot degree centrality of nodes: Degree centrality not correct, since topology not correct => need to subdivide edges
+# tmap_mode("view") # set to interactive mode
+# tm_tiles("CartoDB.Positron") +
+# tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+#   tm_lines() +
+# tm_shape(st_as_sf(network %>% activate("nodes"), "nodes")) +
+#   tm_dots(col = "degree")
+```
+
+```{r}
+# Short summary of network topology
+# summary_net(network)
+```
+
+## Preprocessing topology
+```{r}
+# Subdivide edges: Already done above
+network <- convert(network, to_spatial_subdivision)
+```
+
+```{r}
+# Plot network with subdivided edges with degree centrality
+network <- network %N>% mutate(
+    degree = centrality_degree(weights = NULL))
+
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(st_as_sf(network %>% activate("nodes"), "nodes")) +
+  tm_dots(col = "degree")
+```
+
+```{r}
+net_df <- network %E>% data.frame()
+
+net_df %>% group_by(highway) %>% count() %>% arrange(desc(n))
+net_df %>% group_by(route) %>% count() %>% arrange(desc(n))
+net_df %>% group_by(junction) %>% count() %>% arrange(desc(n))
+net_df %>% group_by(bridge) %>% count() %>% arrange(desc(n))
+```
+
+```{r}
+# Remove pseudo nodes, only if the following attributes are the same
+equal_pseudo <- c("access","bicycle","bridge","cyclestree","cycleway","cycleway_b","cycleway_l","cycleway_1","cycleway_r","cycleway_2","foot","footway","segregated","highway","maxspeed","oneway","oneway_bic","ramp_bicyc","traffic_ca","tunnel","vehicle")
+
+# First the NA values have to be replaced, in order to evaluate equality in the smoothing function
+network <- network %E>%
+  dplyr::mutate(maxspeed = as.numeric(maxspeed),
+                cyclestree = as.character(cyclestree))
+network <- network %E>% mutate_if(is.character, ~replace_na(., "unknown"))
+network <- network %E>% mutate_if(is.numeric, ~replace_na(., -99))
+
+# Define how the attributes of merged segments should be combined
+combinations = list(
+  osm_id = "first",
+  access = "first",
+  barrier = "first",
+  bicycle = "first",
+  bridge = "first",
+  cyclestree = "first",
+  cycleway = "first",
+  cycleway_b = "first",
+  cycleway_l = "first",
+  cycleway_1 = "first",
+  cycleway_r = "first",
+  cycleway_2 = "first",
+  foot = "first",
+  footway = "first",
+  segregated = "first",
+  highway = "first",
+  junction = "first",
+  maxspeed = "first",
+  motorroad = "first",
+  oneway = "first",
+  oneway_bic = "first",
+  ramp_bicyc = "first",
+  traffic_ca = "first",
+  tunnel = "first",
+  vehicle = "first",
+  width = "first",
+  weight = "sum",
+  "ignore" # rest of attributes is ignored and dropped
+)
+
+network <- network %>% convert(to_spatial_smooth, require_equal = equal_pseudo, summarise_attributes = combinations, .clean = TRUE)
+```
+
+```{r}
+# Look at multiple edges
+nrow(network %E>% filter(edge_is_multiple()) %>% st_as_sf())
+
+network %E>% filter(edge_is_multiple()) %>%
+  mutate(
+    length = edge_length()
+  ) %>% as_tibble() %>% select(length) %>% summary()
+
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %E>% filter(edge_is_multiple())), "edges") + tm_lines()
+```
+
+```{r}
+# Remove multiple edges: Removes multiple edges, but also loop edges
+network <- network %E>%
+  arrange(edge_length()) # order in ascending order
+
+# Define how attributes should be combined
+combinations = list(
+  osm_id = "first",
+  access = "first",
+  access_con = "first",
+  barrier = "first", 
+  bicycle = "first",
+  bicycle_co = "first",
+  bicycle_ro = "first",
+  bridge = "first", 
+  cyclestree = function(x) if ("yes" %in% x) "yes" else NA,
+  cycleway = function(x){
+    if("track" %in% x | "yes" %in% x){
+      "track"
+    } else if ("opposite_lane" %in% x | "lane" %in% x){
+      "lane"
+    } else if ("share_busway" %in% x){
+      "share_busway"
+    } else {
+      NA
+    }
+  },
+  cycleway_b = function(x){
+    if("track" %in% x | "yes" %in% x){
+      "track"
+    } else if ("opposite_lane" %in% x | "lane" %in% x){
+      "lane"
+    } else if ("share_busway" %in% x){
+      "share_busway"
+    } else {
+      NA
+    }
+  },
+  cycleway_l = function(x){
+    if("track" %in% x | "yes" %in% x){
+      "track"
+    } else if ("opposite_lane" %in% x | "lane" %in% x){
+      "lane"
+    } else if ("share_busway" %in% x){
+      "share_busway"
+    } else {
+      NA
+    }
+  },
+  cycleway_r = function(x){
+    if("track" %in% x | "yes" %in% x){
+      "track"
+    } else if ("opposite_lane" %in% x| "lane" %in% x){
+      "lane"
+    } else if ("share_busway" %in% x){
+      "share_busway"
+    } else {
+      NA
+    }
+  },
+  cycleway_1 = "first",
+  cycleway_2 = "first",
+  foot = "first",
+  footway = "first",
+  segregated = "first",
+  highway = function(x) if ("cycleway" %in% x) "cycleway" else x[1],
+  junction = "first",
+  maxspeed = "min",
+  motorroad = "first", 
+  mob = "first",
+  oneway = "first",
+  oneway_bic = "first",
+  ramp_bicyc = "first",
+  route = "first",
+  smoothness = "first", 
+  traffic_ca = "first",
+  tunnel = "first", 
+  vehicle = "first",
+  width = "first", 
+  weight = "first",
+  z_order = "first", 
+  "ignore"
+)
+
+network <- network %E>% convert(to_spatial_simple, summarise_attributes = combinations) # choose shortest connection
+```
+
+```{r}
+# Look at loop edges
+nrow(network %E>% filter(edge_is_loop()) %>% st_as_sf())
+loops <- network %E>% filter(edge_is_loop())
+loop_edges <- loops %E>% as_tibble()
+loop_edges$weight
+
+
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %E>% filter(edge_is_loop())), "edges") + tm_lines()
+```
+
+```{r}
+# Drop columns and calculate degree centrality of nodes on new network
+network <- network %E>% select(-any_of(c("osm_id", "access_con", "bicycle_co", "bicycle_ro", "mob", "route", "smoothness", "z_order", "way_area", ".tidygraph_edge_index", "degree_edge", "closeness_edge", "betweenness_edge"))) %N>%
+  select(-any_of(c("degree", "closeness", "betweenness")))
+
+network <- network %N>% mutate(
+    degree = centrality_degree(weights = NULL))
+
+summary_net(network)
+```
+
+Most of the crossings included are redundant, since they connect sidewalks, which are not included in the bike network. Let's therefore only include important crossings using the degree centrality of the starting and end nodes. 
+```{r}
+# Get rid of redundant crossings in the network
+nodes_tibble <- network %N>% as_tibble(spatial = FALSE) %>% select(-geometry)
+edges_tibble <- network %E>% as_tibble(spatial = FALSE)
+edges_tibble <- left_join(edges_tibble, nodes_tibble, by = c("from" = ".tidygraph_node_index")) %>% rename(from_degree = degree)
+edges_tibble <- left_join(edges_tibble, nodes_tibble, by = c("to" = ".tidygraph_node_index")) %>% rename(to_degree = degree)
+
+network <- network %E>%
+  mutate(from_degree = edges_tibble$from_degree,
+         to_degree = edges_tibble$to_degree,
+         keep_edge = ifelse((footway == "crossing" | highway == "crossing") & (from_degree == 1 | to_degree == 1), 0, 1))
+
+network <- network %E>%
+  filter(keep_edge == 1) %N>% 
+  filter(!node_is_isolated())
+```
+
+```{r}
+# Plot degree centrality of nodes
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(st_as_sf(network %>% activate("nodes"), "nodes")) +
+  tm_dots(col = "degree")
+```
+
+```{r}
+# Main component
+components <- components(network)$membership
+main_comp_id <- which.max(components(network)$csize)
+
+network <- network %N>%
+  mutate(
+    component = components
+  )
+
+main_graph <- network %N>%
+  filter(component == main_comp_id)
+
+summary_net(main_graph)
+```
+
+```{r}
+# Plot main connected component
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(main_graph %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(st_as_sf(main_graph %>% activate("nodes"), "nodes")) +
+  tm_dots()
+# tm_shape(st_as_sf(full_network %>% activate("edges") %>% filter(footway == "crossing" | highway == "crossing")), "edges") +
+#   tm_lines(col = "red")
+```
+
+```{r}
+# Plot main connected component with ggplot()
+ggplot() + geom_sf(data = main_graph %E>% st_as_sf(), fill="white", size=0.45) +
+  coord_sf(datum = 2056) +
+  theme_void() +
+  labs(title="Bike network")
+```
+
+```{r}
+# Sub-components
+sub_graphs <- network %N>%
+  filter(component != 1)
+
+sub_graphs <- sub_graphs %N>% 
+  mutate(
+    nindex = 1:nrow(sub_graphs %N>% as_tibble())
+  )
+
+sub_graphs_edges <- sub_graphs %E>% as_tibble() %>% as.data.frame()
+sub_graphs_nodes <- sub_graphs %N>% as_tibble() %>% as.data.frame() %>% select(nindex, component)
+sub_graphs_edges <- sub_graphs_edges %>% left_join(sub_graphs_nodes, by = c("from"="nindex"))
+sub_graphs_edges$weight <- as.numeric(sub_graphs_edges$weight)
+sub_graphs_edges %>% group_by(component) %>% summarise(tot_length = sum(weight)) %>% summary()
+
+summary_net(sub_graphs)
+```
+
+If the disconnected sub-components are small in length and more or less randomly distributed in the study area, just work with extracted main connected component. 
+```{r}
+# Plot disconnected sub-components
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(sub_graphs %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(st_as_sf(sub_graphs %>% activate("nodes"), "nodes")) +
+  tm_dots()
+```
+
+```{r}
+# Check for under- and overpassing edges
+nrow(main_graph %>% activate(edges) %>% filter(edge_crosses(.E())) %>% st_as_sf())
+underoveredges <- main_graph %>% activate(edges) %>% filter(edge_crosses(.E())) %N>% filter(!node_is_isolated())
+
+underoveredges %E>% as_tibble() %>% group_by(bridge) %>% count() %>% arrange(desc(n))
+underoveredges %E>% as_tibble() %>% group_by(tunnel) %>% count() %>% arrange(desc(n))
+
+bridges <- underoveredges %E>% filter(bridge == "yes" | bridge == "viaduct") %N>% filter(!node_is_isolated())
+
+tunnels <- underoveredges %E>% filter(tunnel == "yes") %N>% filter(!node_is_isolated())
+no_bridge_tunnel <- underoveredges %E>% filter(bridge == "unknown" & tunnel == "unknown") %N>% filter(!node_is_isolated())
+
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(bridges %E>% st_as_sf(), "bridges") +
+  tm_lines(col = "red") + tm_shape(tunnels %E>% st_as_sf(), "tunnels") + tm_lines(col = "blue") +
+  tm_shape(no_bridge_tunnel %E>% st_as_sf(), "no") + tm_lines(col = "black")
+  tm_shape(st_as_sf(sub_graphs %>% activate("nodes"), "nodes")) +
+  tm_dots()
+```
+
+```{r}
+# Use main graph as final network
+network <- main_graph
+
+# Assign edge length to edges of network
+network <- network %E>%
+  mutate(
+    weight = edge_length())
+
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(weight) %>% summary()
+net_df <- network %E>% as_tibble(spatial = FALSE)
+quantile(net_df$weight, 0.99)
+```
+
+```{r}
+# Manipulate maxspeed columns to numeric
+network <- network %E>%
+  dplyr::mutate(cyclestree = as.character(cyclestree))
+
+network <- network %E>% mutate_if(is.character, ~replace_na(., "unknown"))
+network <- network %E>% mutate_if(is.numeric, ~replace_na(., -99))
+
+# Drop columns used to look at crossings
+network <- network %E>% select(-any_of(c("from_degree", "to_degree", "keep_edge")))
+```
+
+```{r}
+# Define function to add edges between two nodes
+addedge <- function(node1_index, node2_index, highway){
+  n1 <- network %N>% filter(.tidygraph_node_index == node1_index) %>% st_coordinates()
+  n2 <- network %N>% filter(.tidygraph_node_index == node2_index) %>% st_coordinates()
+  l <- st_linestring(rbind(c(n1[, 1], n1[, 2]), c(n2[, 1], n2[, 2])))
+  lsf <- st_sf(geometry = st_sfc(l), crs = 2056)
+  lnet <- as_sfnetwork(lsf, directed = FALSE) %E>%
+    mutate(weight = edge_length(), highway = highway)
+  lnet <- tidygraph::convert(
+    lnet,
+    to_undirected,
+    .clean = TRUE
+)
+  network <- st_network_join(network, lnet)
+}
+
+# Add edges to network
+network <- addedge(8176, 8174, "cycleway")
+network <- addedge(13927, 11044, "cycleway")
+network <- addedge(6654, 6655, "path")
+network <- addedge(7039, 7040, "footway")
+network <- addedge(7275, 6528, "footway")
+network <- addedge(7395, 7390, "pedestrian")
+network <- addedge(5539, 5536, "footway")
+network <- addedge(6661, 6664, "footway")
+network <- addedge(17825, 17831, "path")
+network <- addedge(17844, 17831, "path")
+
+network <- network %E>% mutate_if(is.character, ~replace_na(., "unknown"))
+network <- network %E>% mutate_if(is.numeric, ~replace_na(., -99))
+
+network <- tidygraph::convert(
+    network,
+    to_undirected,
+    .clean = TRUE
+)
+```
+
+```{r}
+# Split segments with a length >400m into 6 parts for later slope calculation
+edges <- network %E>% as_tibble() %>% st_as_sf()
+
+long_edges <- edges %>% filter(drop_units(weight) > 400)
+short_edges <- edges %>% filter(drop_units(weight) <= 400)
+shortened_edges <- line_segment(long_edges, n_segments = 6)
+edges_new <- rbind(short_edges, shortened_edges)
+network <- as_sfnetwork(edges_new, directed = FALSE)
+
+network <- network %E>% 
+  mutate(
+    weight = edge_length())
+
+network <- network %N>%
+  mutate(
+    degree = centrality_degree(weights = NULL)
+  )
+
+network %E>% as_tibble(spatial = FALSE) %>% dplyr::select(weight) %>% summary()
+```
+
+## Check distance of population points to nearest network node
+```{r}
+# Find nearest network node to cell centers. Function from https://github.com/r-spatial/sf/issues/966
+find_nearest_node <- function(points, nodes){
+  points %>%
+  mutate(
+    index_of_nearest_feature = st_nearest_feature(., nodes),
+    nearest_feature = st_geometry(nodes[index_of_nearest_feature,]),
+    nearest_point = purrr::pmap(
+      list(geometry, nearest_feature),
+      ~ st_nearest_points(.x, .y) %>% st_cast("POINT") %>% magrittr::extract2(2)
+    ) 
+  ) %>%
+  pull(nearest_point) %>%
+  st_sfc(crs = 2056)
+}
+
+nodes_tibble <- network %N>%
+  as_tibble()
+nodes_tibble <- st_as_sf(nodes_tibble, sf_column_name = "geometry")
+
+nearest_nodes_pop <- find_nearest_node(statpop, nodes_tibble)
+
+# Distances of population points to nearest network node
+summary(st_distance(statpop, nearest_nodes_pop, by_element = TRUE))
+which.max(st_distance(statpop, nearest_nodes_pop, by_element = TRUE))
+
+# Alternatively, blend points onto network: st_network_blend()
+```
+
+## Save preprocessed network
+```{r}
+# Save preprocessed network
+saveRDS(network, file = here::here("data", "lausanne/network_ls.rds"))
+edges <- network %E>% as_tibble() %>% st_as_sf()
+nodes <- network %N>% as_tibble() %>% st_as_sf()
+
+st_write(edges, dsn = here::here("data", "lausanne/edges_ls.shp"), delete_layer = TRUE)
+st_write(nodes, dsn = here::here("data", "lausanne/nodes_ls.shp"), delete_layer = TRUE)
+```
+
+```{r}
+# Plot final network
+tmap_mode("view") # set to interactive mode
+tm_tiles("CartoDB.Positron") +
+tm_shape(st_as_sf(network %>% activate("edges")), "edges") +
+  tm_lines() +
+tm_shape(st_as_sf(network %>% activate("nodes"), "nodes")) +
+  tm_dots()
+```
+
+
+
